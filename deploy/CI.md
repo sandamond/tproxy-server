@@ -120,9 +120,23 @@ design, per the section above.
 ## Required repository settings
 
 - Branch protection on `master`: PR required, `enforce_admins` on, force-push
-  and deletion disallowed (already configured). Once `test.yml` has run at
-  least once, its check should be added to `required_status_checks` so a red
-  test run blocks merging, not just informs it.
+  and deletion disallowed, `required_conversation_resolution` on. Once
+  `test.yml` had run for real, its three job names became required status
+  checks with `strict: true` (branch must be up to date with `master` to
+  merge):
+
+  ```bash
+  gh api --method PUT repos/sandamond/tproxy-server/branches/master/protection \
+    --input - <<'JSON'
+  {"required_status_checks":{"strict":true,"contexts":["relay","keys-panel","shellcheck-syntax"]}, ...}
+  JSON
+  ```
+
+  (the full body needs every other protection field repeated - this endpoint
+  replaces the whole configuration, it doesn't merge a partial update.)
+  `deploy` is deliberately **not** in that list: it only ever runs after a
+  push to `master`, so requiring it on a PR would be a check that can never
+  pass before the merge that's supposed to produce it.
 - "Fork pull request workflows from outside collaborators" set to require
   approval for all external contributors (already applied):
 
@@ -137,6 +151,16 @@ design, per the section above.
   (`first_time_contributors_new_to_github`, `first_time_contributors`,
   `all_external_contributors`) - GitHub's own naming, not something to guess
   from the web UI label alone.
+
+## Automated review bots and `required_conversation_resolution`
+
+This repository has the Codex GitHub App (`chatgpt-codex-connector`) reviewing
+pull requests. `required_conversation_resolution` blocks merging while any
+review thread is unresolved, bot-authored ones included - the first CI PR
+here got stuck on exactly this until an unresolved Codex comment was
+addressed and its thread resolved. If a PR won't merge and every status
+check is green, check for an open review thread before assuming something
+else is wrong.
 
 ## If the pipeline is down
 
