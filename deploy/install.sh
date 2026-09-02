@@ -143,10 +143,7 @@ if [[ -z "$go_binary" ]]; then
 	go_binary="/opt/go${go_version}/bin/go"
 fi
 
-# Run tests under a normal umask: this script's own umask 077 makes a
-# config-package test fixture come out 0400 instead of the 0444 it
-# writes, which then fails TestLoadAcceptsSystemdCredentialReadPermissions.
-(umask 022; cd "$repository" && "$go_binary" test ./...)
+(cd "$repository" && "$go_binary" test ./...)
 (cd "$repository" && "$go_binary" build -trimpath -ldflags='-s -w' -o /usr/local/bin/tproxy-server ./cmd/tproxy-server)
 chown root:root /usr/local/bin/tproxy-server
 chmod 0755 /usr/local/bin/tproxy-server
