@@ -12,6 +12,18 @@ name: deploy
 on:
   push:
     branches: [master]
+    # Only what deploy/ci-deploy.sh actually rebuilds and restarts services
+    # for. A push that only touches docs or test.yml has nothing for this
+    # workflow to do, and every run here restarts tproxy-server and
+    # tproxy-keys, dropping live sessions - not worth doing for a no-op.
+    paths:
+      - 'cmd/**'
+      - 'internal/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'keys-panel/**'
+      - 'deploy/update-relay.sh'
+      - '.github/workflows/deploy.yml'
 
 permissions:
   contents: read
