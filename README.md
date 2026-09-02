@@ -440,6 +440,19 @@ separate quotas or routing. Extend `firewall.nft` to include every added backend
 port. A single MTProxy may receive repeated `-S` arguments only when all profiles
 intentionally share the same policy and routing scope.
 
+### Managing profiles with tproxy-keys
+
+That last case — one MTProxy, several client secrets sharing one backend and
+policy — is what [`keys-panel/`](keys-panel/README.md) is for. Hand-editing
+`profiles.json` and the matching MTProxy `-S` arguments in sync, then restarting
+both services in the right order, is easy to get wrong by hand; the relay also has
+no hot reload, so every change needs that restart regardless. `tproxy-keys` is a
+small CLI and loopback-only web UI that validates a candidate profile set with this
+relay's own `-check` before writing it, keeps MTProxy's secret list in sync through
+a systemd drop-in, restarts both services, and rolls back if the restart doesn't
+come back healthy. See [`keys-panel/README.md`](keys-panel/README.md) for
+installation and use.
+
 ### Capacity limits
 
 The process-wide limits in `config.json` are the mandatory safety boundary. The

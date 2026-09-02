@@ -143,7 +143,10 @@ if [[ -z "$go_binary" ]]; then
 	go_binary="/opt/go${go_version}/bin/go"
 fi
 
-(cd "$repository" && "$go_binary" test ./...)
+# Run tests under a normal umask: this script's own umask 077 makes a
+# config-package test fixture come out 0400 instead of the 0444 it
+# writes, which then fails TestLoadAcceptsSystemdCredentialReadPermissions.
+(umask 022; cd "$repository" && "$go_binary" test ./...)
 (cd "$repository" && "$go_binary" build -trimpath -ldflags='-s -w' -o /usr/local/bin/tproxy-server ./cmd/tproxy-server)
 chown root:root /usr/local/bin/tproxy-server
 chmod 0755 /usr/local/bin/tproxy-server
@@ -245,6 +248,21 @@ done
 if [[ -z "$relay_ready" ]]; then
 	echo "tproxy-server did not become ready" >&2
 	exit 1
+fi
+
+# profiles.json above was just reset to the single "default" profile. If the
+# tproxy-keys panel (see ../keys-panel) is installed, official MTProxy is
+# actually reading its client secret list from a separate systemd drop-in that
+# this installer does not touch, so that list is now stale — MTProxy would go
+# on serving a secret set that no longer matches profiles.json. Resync it here
+# rather than leaving that mismatch for the operator to find later.
+if [[ -e /etc/systemd/system/mtproxy.service.d/secrets.conf ]] && command -v /usr/local/bin/tproxy-keys >/dev/null 2>&1; then
+	echo "tproxy-keys detected: resyncing MTProxy's client secret list"
+	if ! /usr/local/bin/tproxy-keys sync; then
+		echo "tproxy-keys sync failed; MTProxy's secret list may not match profiles.json" >&2
+		echo "run 'tproxy-keys sync' by hand once the underlying problem is fixed" >&2
+		exit 1
+	fi
 fi
 
 echo
