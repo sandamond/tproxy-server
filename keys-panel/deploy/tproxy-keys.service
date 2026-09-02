@@ -1,0 +1,30 @@
+[Unit]
+Description=tproxy-keys local key management panel
+After=network.target tproxy-server.service
+Wants=tproxy-server.service
+
+[Service]
+Type=simple
+# The panel edits mode-0400 root-owned configuration and restarts units, so it
+# runs as root. It never listens anywhere but loopback, and reaching it still
+# requires the SSH access that already grants root on this host.
+ExecStart=/usr/local/bin/tproxy-keys serve -listen 127.0.0.1:9000
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+# strict would also mount /run read-only, and the panel has to reach systemd's
+# private socket there to restart units.
+ProtectSystem=full
+ReadWritePaths=/etc/tproxy-server /etc/tproxy-keys /etc/mtproxy
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
