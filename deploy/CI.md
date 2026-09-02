@@ -123,10 +123,20 @@ design, per the section above.
   and deletion disallowed (already configured). Once `test.yml` has run at
   least once, its check should be added to `required_status_checks` so a red
   test run blocks merging, not just informs it.
-- Settings → Actions → General → "Fork pull request workflows from outside
-  collaborators" → require approval for all outside collaborators. Defense
-  in depth for `test.yml` on the hosted runner; not load-bearing for the
-  self-hosted runner's safety, which rests on the trigger topology above.
+- "Fork pull request workflows from outside collaborators" set to require
+  approval for all external contributors (already applied):
+
+  ```bash
+  gh api --method PUT repos/sandamond/tproxy-server/actions/permissions/fork-pr-contributor-approval \
+    -f approval_policy=all_external_contributors
+  ```
+
+  Defense in depth for `test.yml` on the hosted runner; not load-bearing for
+  the self-hosted runner's safety, which rests on the trigger topology above.
+  This setting has three possible values
+  (`first_time_contributors_new_to_github`, `first_time_contributors`,
+  `all_external_contributors`) - GitHub's own naming, not something to guess
+  from the web UI label alone.
 
 ## If the pipeline is down
 
