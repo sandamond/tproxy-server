@@ -234,6 +234,14 @@ func TestLoadAcceptsSystemdCredentialReadPermissions(t *testing.T) {
 	if err := os.WriteFile(profiles, []byte(content), 0444); err != nil {
 		t.Fatal(err)
 	}
+	// os.WriteFile applies the test binary's process umask, so a restrictive
+	// umask (install.sh runs the suite under 077) silently strips the
+	// group/other bits the second Load call below must reject, making that
+	// assertion pass vacuously. Set the mode explicitly so the fixture means
+	// what it says regardless of the caller's umask.
+	if err := os.Chmod(profiles, 0444); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("CREDENTIALS_DIRECTORY", credentials)
 	server := `{"public_hostname":"proxy.example.com","public_dir":"public","profiles_file":"credentials/profiles.json"}`
 	path := filepath.Join(directory, "config.json")

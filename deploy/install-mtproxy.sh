@@ -40,10 +40,6 @@ if [[ ! -x "$source_directory/objs/bin/mtproto-proxy" ]] ||
 	test -x "$build_directory/objs/bin/mtproto-proxy"
 	printf '%s\n' "$mtproxy_commit" > "$build_directory/.tproxy-commit"
 	chown -R root:root "$build_directory"
-	# install.sh sets umask 077 before calling this script, so make's
-	# output is created 0700. The mtproxy.service unit execs this binary
-	# as the mtproxy user, which then can't read or run it.
-	chmod -R a+rX "$build_directory"
 	if [[ -e "$source_directory" ]]; then
 		mv "$source_directory" "$source_directory.before-tproxy.$(date +%Y%m%d%H%M%S)"
 	fi
@@ -51,6 +47,17 @@ if [[ ! -x "$source_directory/objs/bin/mtproto-proxy" ]] ||
 	trap - EXIT
 	rm -rf "$temporary"
 fi
+
+# install.sh sets umask 077 before calling this script, so make's output
+# (objs/, objs/bin/, the binary) keeps owner-only permissions; mtproxy.service
+# runs this binary as User=mtproxy, which can then neither traverse nor exec
+# it. Grant exactly the mtproxy group what it needs, matching the root:mtproxy
+# 0750 scheme this installer already uses for /etc/mtproxy below, rather than
+# opening the tree to every user on the host. This runs on every invocation,
+# not only after a fresh build, so re-running the installer also repairs a
+# host a previous interrupted run left in a bad state.
+chown root:mtproxy "$source_directory/objs" "$source_directory/objs/bin" "$source_directory/objs/bin/mtproto-proxy"
+chmod 0750 "$source_directory/objs" "$source_directory/objs/bin" "$source_directory/objs/bin/mtproto-proxy"
 
 install -d -o root -g mtproxy -m 0750 /etc/mtproxy
 secret_temp="$(mktemp /etc/mtproxy/proxy-secret.XXXXXX)"
