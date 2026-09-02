@@ -571,6 +571,13 @@ when the old deployment was ready, backend readiness; a failure automatically ro
 back to the previous binary. Existing carrier sessions are invalidated; clients
 must obtain a fresh bridge page and relay session automatically.
 
+This script (and the equivalent for `keys-panel/`) is what
+[`deploy/CI.md`](deploy/CI.md) runs automatically on every merge to `master`, from a
+self-hosted GitHub Actions runner on the production host. That document is also the
+trust model for why a self-hosted runner is safe to use here despite this being a
+public repository - read it before changing anything under `.github/workflows/` or
+`deploy/ci-deploy.sh`.
+
 This script intentionally does not replace configuration, systemd units, Caddy,
 MTProxy, firewall rules, or public-site files. Running the complete automated
 installer again preserves an existing site directory but replaces the single-profile

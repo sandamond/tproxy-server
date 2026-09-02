@@ -1,0 +1,29 @@
+name: deploy
+
+# Deliberately triggers on `push` to `master` only - never on `pull_request`,
+# even from this repository itself. A push to master can only happen via a
+# merge, which the branch protection on master restricts to repository
+# collaborators (currently just the owner). This is what keeps the
+# self-hosted runner below safe to use on a public repository: an outside
+# PR can update this very workflow file in its own branch, but that changed
+# file only ever runs (via pull_request, on a GitHub-hosted runner, see
+# test.yml) against the fork it lives in - it can never cause a `push` event
+# on *this* repository's `master`. See deploy/CI.md for the full writeup.
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, tproxy-deploy]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: deploy
+        run: sudo /usr/local/sbin/ci-deploy.sh
