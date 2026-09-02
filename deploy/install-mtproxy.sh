@@ -40,6 +40,10 @@ if [[ ! -x "$source_directory/objs/bin/mtproto-proxy" ]] ||
 	test -x "$build_directory/objs/bin/mtproto-proxy"
 	printf '%s\n' "$mtproxy_commit" > "$build_directory/.tproxy-commit"
 	chown -R root:root "$build_directory"
+	# install.sh sets umask 077 before calling this script, so make's
+	# output is created 0700. The mtproxy.service unit execs this binary
+	# as the mtproxy user, which then can't read or run it.
+	chmod -R a+rX "$build_directory"
 	if [[ -e "$source_directory" ]]; then
 		mv "$source_directory" "$source_directory.before-tproxy.$(date +%Y%m%d%H%M%S)"
 	fi
