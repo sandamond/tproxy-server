@@ -54,6 +54,7 @@ type Paths struct {
 	RelayBin   string
 	Meta       string
 	MTProxyEnv string
+	Backends   string
 	Token      string
 	ReadyURL   string
 }
@@ -65,9 +66,78 @@ func DefaultPaths() Paths {
 		RelayBin:   "/usr/local/bin/tproxy-server",
 		Meta:       "/etc/tproxy-keys/meta.json",
 		MTProxyEnv: "/etc/mtproxy/mtproxy-keys.env",
+		Backends:   "/etc/tproxy-keys/backends.json",
 		Token:      "/etc/tproxy-keys/panel.token",
 		ReadyURL:   "http://127.0.0.1:8081/readyz",
 	}
+}
+
+// maxSecretsPerBackend is official MTProxy's own hard ceiling, not ours to
+// raise: net/net-tcp-rpc-ext-server.c asserts ext_secret_cnt < 16 and aborts
+// the process past it. Confirmed live 2026-09-22 trying to load 60 secrets
+// into one backend - MTProxy crash-looped and Apply's own rollback (below)
+// is what caught it, not this constant, because this constant didn't exist
+// yet. See deploy/provision-mtproxy-backend.sh for adding backend capacity.
+const maxSecretsPerBackend = 16
+
+// BackendInfo is one official-MTProxy process this deployment can assign
+// client secrets to.
+type BackendInfo struct {
+	Address string `json:"address"`
+	Unit    string `json:"unit"`
+	EnvFile string `json:"env_file"`
+}
+
+type BackendRegistry struct {
+	Backends []BackendInfo `json:"backends"`
+}
+
+// LoadBackends reads the backend registry, or - for a deployment from before
+// multi-backend support existed, which has no registry file at all - returns
+// the single backend the reference installer has always set up, using the
+// env file tproxy-keys has always written. This keeps every existing
+// deployment working with zero migration step.
+func LoadBackends(p Paths) (*BackendRegistry, error) {
+	raw, err := os.ReadFile(p.Backends)
+	if err != nil {
+		return &BackendRegistry{Backends: []BackendInfo{{
+			Address: "127.0.0.1:2398",
+			Unit:    "mtproxy.service",
+			EnvFile: p.MTProxyEnv,
+		}}}, nil
+	}
+	var registry BackendRegistry
+	if err := json.Unmarshal(raw, &registry); err != nil {
+		return nil, fmt.Errorf("backends file: %w", err)
+	}
+	if len(registry.Backends) == 0 {
+		return nil, errors.New("backends file lists no backends")
+	}
+	return &registry, nil
+}
+
+// backendUsage counts how many profiles already sit on each backend address.
+func backendUsage(file *ProfileFile) map[string]int {
+	usage := map[string]int{}
+	for _, profile := range file.Profiles {
+		usage[profile.Backend]++
+	}
+	return usage
+}
+
+// pickBackend returns the first registered backend with room for one more
+// secret, given the counts already committed to `usage` (which the caller
+// updates as it assigns each key in a batch, so a multi-key batch spreads
+// correctly across backends instead of only ever considering the first one).
+func pickBackend(registry *BackendRegistry, usage map[string]int) (string, error) {
+	for _, backend := range registry.Backends {
+		if usage[backend.Address] < maxSecretsPerBackend {
+			return backend.Address, nil
+		}
+	}
+	return "", fmt.Errorf(
+		"every registered backend is at official MTProxy's %d-secret limit; run deploy/provision-mtproxy-backend.sh to add capacity",
+		maxSecretsPerBackend)
 }
 
 var nameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`)
@@ -201,8 +271,17 @@ func Apply(p Paths, file *ProfileFile) error {
 	if limit := maxProfiles(p); len(file.Profiles) > limit {
 		return fmt.Errorf("the relay's configured limits.max_profiles is %d; this would exceed it", limit)
 	}
+	registry, err := LoadBackends(p)
+	if err != nil {
+		return err
+	}
+	registered := map[string]bool{}
+	for _, backend := range registry.Backends {
+		registered[backend.Address] = true
+	}
 	seenName := map[string]bool{}
 	seenSecret := map[string]bool{}
+	perBackend := map[string]int{}
 	for _, profile := range file.Profiles {
 		if !nameRE.MatchString(profile.Name) {
 			return fmt.Errorf("name %q: use 1-64 characters from a-z A-Z 0-9 . _ -", profile.Name)
@@ -219,8 +298,20 @@ func Apply(p Paths, file *ProfileFile) error {
 		if seenSecret[profile.Secret] {
 			return fmt.Errorf("duplicate secret on key %q", profile.Name)
 		}
+		if !registered[profile.Backend] {
+			return fmt.Errorf("key %q: backend %q is not in the backend registry", profile.Name, profile.Backend)
+		}
 		seenName[profile.Name] = true
 		seenSecret[profile.Secret] = true
+		perBackend[profile.Backend]++
+		// Belt and suspenders: pickBackend should already prevent this, but
+		// official MTProxy crash-loops past 16 secrets with no graceful
+		// error of its own, so this path must never rely solely on callers
+		// having used pickBackend correctly.
+		if perBackend[profile.Backend] > maxSecretsPerBackend {
+			return fmt.Errorf("backend %q would carry %d secrets, over official MTProxy's %d-secret limit",
+				profile.Backend, perBackend[profile.Backend], maxSecretsPerBackend)
+		}
 	}
 
 	candidate, err := marshalProfiles(file)
@@ -257,18 +348,22 @@ func Apply(p Paths, file *ProfileFile) error {
 	if err := writeFileAtomic(p.Profiles, candidate, 0400, "tproxy"); err != nil {
 		return err
 	}
-	if err := syncBackendSecrets(p, file); err != nil {
+	changedUnits, err := syncBackendSecrets(p, registry, file)
+	if err != nil {
 		restore(p, previous)
 		return err
 	}
-	fmt.Fprintln(os.Stderr, "applying: restarting mtproxy and the relay, live sessions drop")
-	if err := restartStack(p); err != nil {
+	fmt.Fprintf(os.Stderr, "applying: restarting %s and the relay, live sessions on the affected backend(s) drop\n",
+		strings.Join(changedUnits, ", "))
+	if err := restartStack(p, changedUnits); err != nil {
 		restore(p, previous)
 		var restoreFile ProfileFile
 		if json.Unmarshal(previous, &restoreFile) == nil {
-			_ = syncBackendSecrets(p, &restoreFile)
+			if restoreUnits, syncErr := syncBackendSecrets(p, registry, &restoreFile); syncErr == nil {
+				changedUnits = restoreUnits
+			}
 		}
-		if second := restartStack(p); second != nil {
+		if second := restartStack(p, changedUnits); second != nil {
 			return fmt.Errorf("%w; rollback also failed: %v", err, second)
 		}
 		return fmt.Errorf("%w; the previous key set was restored", err)
@@ -280,23 +375,88 @@ func restore(p Paths, previous []byte) {
 	_ = writeFileAtomic(p.Profiles, previous, 0400, "tproxy")
 }
 
-// syncBackendSecrets keeps official MTProxy aware of every client secret. The
-// stock unit passes a single -S through ${MTPROXY_SECRET}, which systemd always
-// expands to exactly one argument; the panel's drop-in reads this file and uses
-// the splitting $MTPROXY_SECRET_ARGS form instead.
-func syncBackendSecrets(p Paths, file *ProfileFile) error {
-	arguments := make([]string, 0, len(file.Profiles))
-	for _, profile := range file.Profiles {
-		arguments = append(arguments, "-S "+backendSecret(profile.Secret))
+// syncBackendSecrets keeps every registered official-MTProxy backend aware of
+// exactly the client secrets assigned to it. The stock unit passes a single
+// -S through ${MTPROXY_SECRET}, which systemd always expands to exactly one
+// argument; every backend's env file instead carries a splitting
+// $MTPROXY_SECRET_ARGS (the name backend 0's already-deployed drop-in reads)
+// and, redundantly, $MTPROXY_BACKEND_SECRET_ARGS (the name the mtproxy@.
+// service template reads) - writing both into every file is simpler than
+// tracking which name a given backend actually needs, and the unused one is
+// just an unreferenced environment variable.
+//
+// It returns the systemd units whose secret list actually changed, so the
+// caller restarts only those - not every backend on every edit, which would
+// disconnect an unrelated backend's live users for no reason.
+func syncBackendSecrets(p Paths, registry *BackendRegistry, file *ProfileFile) ([]string, error) {
+	arguments := map[string][]string{}
+	for _, backend := range registry.Backends {
+		arguments[backend.Address] = nil // ensure every backend gets a (possibly empty) write below
 	}
-	content := "# Written by tproxy-keys. Do not edit by hand.\n" +
-		"MTPROXY_SECRET_ARGS=" + strings.Join(arguments, " ") + "\n"
-	return writeFileAtomic(p.MTProxyEnv, []byte(content), 0640, "mtproxy")
+	for _, profile := range file.Profiles {
+		arguments[profile.Backend] = append(arguments[profile.Backend], "-S "+backendSecret(profile.Secret))
+	}
+
+	var changed []string
+	for _, backend := range registry.Backends {
+		joined := strings.Join(arguments[backend.Address], " ")
+		content, err := upsertSecretArgs(backend.EnvFile, joined)
+		if err != nil {
+			return nil, err
+		}
+		previous, _ := os.ReadFile(backend.EnvFile)
+		if string(previous) == content {
+			continue
+		}
+		if err := writeFileAtomic(backend.EnvFile, []byte(content), 0640, "mtproxy"); err != nil {
+			return nil, err
+		}
+		changed = append(changed, backend.Unit)
+	}
+	return changed, nil
 }
 
-func restartStack(p Paths) error {
-	if err := systemctl("restart", "mtproxy.service"); err != nil {
-		return fmt.Errorf("mtproxy restart failed: %w", err)
+// upsertSecretArgs rewrites only the two secret-argument lines this package
+// owns in a backend's env file, preserving every other line untouched.
+//
+// A freshly-provisioned backend's env file (deploy/provision-mtproxy-backend.sh)
+// also carries MTPROXY_CLIENT_PORT and MTPROXY_ADMIN_PORT, which
+// mtproxy@.service's ExecStart depends on and nothing else ever sets; the
+// first version of this function overwrote the whole file with just the
+// secret lines and blanked those out, so mtproxy@1.service failed with
+// literal, unexpanded "${MTPROXY_ADMIN_PORT}" on its command line the moment
+// a key was ever assigned to it - confirmed live, not hypothetical. Backend
+// 0's env file has no such foreign lines, so for it this is equivalent to
+// the old unconditional rewrite.
+func upsertSecretArgs(path, joinedArgs string) (string, error) {
+	const (
+		header = "# Written by tproxy-keys. Do not edit by hand."
+		plain  = "MTPROXY_SECRET_ARGS="
+		spread = "MTPROXY_BACKEND_SECRET_ARGS="
+	)
+	existing, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+	var kept []string
+	for _, line := range strings.Split(string(existing), "\n") {
+		if line == "" || line == header || strings.HasPrefix(line, plain) || strings.HasPrefix(line, spread) {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	kept = append(kept, header, plain+joinedArgs, spread+joinedArgs)
+	return strings.Join(kept, "\n") + "\n", nil
+}
+
+// restartStack restarts every unit in units (each an MTProxy backend whose
+// secrets actually changed) plus, always, the relay itself - profiles.json
+// changed regardless of which backend(s) did.
+func restartStack(p Paths, units []string) error {
+	for _, unit := range units {
+		if err := systemctl("restart", unit); err != nil {
+			return fmt.Errorf("%s restart failed: %w", unit, err)
+		}
 	}
 	if err := systemctl("restart", "tproxy-server.service"); err != nil {
 		return fmt.Errorf("relay restart failed: %w", err)
@@ -497,10 +657,15 @@ func AddKeys(p Paths, requests []NewKeyRequest) ([]Profile, error) {
 	for _, profile := range file.Profiles {
 		existing[profile.Name] = true
 	}
-	backend := "127.0.0.1:2398"
-	if len(file.Profiles) > 0 {
-		backend = file.Profiles[0].Backend
+	registry, err := LoadBackends(p)
+	if err != nil {
+		return nil, err
 	}
+	// Seeded from what's already committed, then incremented as this batch
+	// assigns each key, so N keys in one import correctly spread across
+	// backends instead of every one of them landing on whichever backend
+	// looked free before the batch started.
+	usage := backendUsage(file)
 
 	seenInBatch := map[string]bool{}
 	added := make([]Profile, 0, len(requests))
@@ -515,7 +680,12 @@ func AddKeys(p Paths, requests []NewKeyRequest) ([]Profile, error) {
 		if !validCarrier(request.Mode) {
 			return nil, fmt.Errorf("key %q: carrier mode must be one of %s", name, carrierModes)
 		}
+		backend, err := pickBackend(registry, usage)
+		if err != nil {
+			return nil, fmt.Errorf("key %q: %w", name, err)
+		}
 		seenInBatch[name] = true
+		usage[backend]++
 		secret, err := NewSecret()
 		if err != nil {
 			return nil, err
@@ -632,16 +802,28 @@ func RotateKey(p Paths, name string) (Profile, error) {
 	return Profile{}, nil
 }
 
-// Sync rewrites the MTProxy secret list from the current profiles and restarts
-// the stack. It repairs the deployment after the reference installer has been
-// re-run, which rewrites mtproxy.env from scratch.
+// Sync rewrites every registered backend's MTProxy secret list from the
+// current profiles and restarts the whole backend fleet plus the relay. It
+// repairs the deployment after the reference installer has been re-run,
+// which rewrites the shared /etc/mtproxy/mtproxy.env (workers, NAT args)
+// that every backend instance reads alongside its own secret file - so this
+// restarts every registered backend unconditionally, not just whichever
+// one's secret list happens to have changed.
 func Sync(p Paths) error {
 	file, err := LoadProfiles(p)
 	if err != nil {
 		return err
 	}
-	if err := syncBackendSecrets(p, file); err != nil {
+	registry, err := LoadBackends(p)
+	if err != nil {
 		return err
 	}
-	return restartStack(p)
+	if _, err := syncBackendSecrets(p, registry, file); err != nil {
+		return err
+	}
+	units := make([]string, len(registry.Backends))
+	for i, backend := range registry.Backends {
+		units[i] = backend.Unit
+	}
+	return restartStack(p, units)
 }

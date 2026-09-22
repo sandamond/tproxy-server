@@ -1,0 +1,45 @@
+[Unit]
+Description=Official Telegram MTProxy backend (instance %i)
+After=network-online.target tproxy-firewall.service
+Wants=network-online.target
+Requires=tproxy-firewall.service
+
+[Service]
+Type=simple
+User=mtproxy
+Group=mtproxy
+# Every extra backend instance shares the same worker defaults and the same
+# Telegram-side secret/routing files as the primary mtproxy.service - those
+# describe how to reach Telegram's infrastructure, not any one client
+# secret, so there is nothing instance-specific about them.
+EnvironmentFile=/etc/mtproxy/mtproxy.env
+# Written once by deploy/provision-mtproxy-backend.sh: MTPROXY_CLIENT_PORT,
+# MTPROXY_ADMIN_PORT (both unique per instance - %i alone can't be turned
+# into an arithmetic port offset inside a unit file, so the script computes
+# them once, in real arithmetic, at provisioning time) and
+# MTPROXY_BACKEND_SECRET_ARGS (kept in sync by `tproxy-keys`, empty until at
+# least one key is assigned to this backend).
+EnvironmentFile=/etc/mtproxy/mtproxy-backend-%i.env
+Environment=MTPROXY_WORKERS=1
+Environment=MTPROXY_MAX_CONNECTIONS=4096
+Environment=MTPROXY_NAT_ARGS=
+WorkingDirectory=/opt/MTProxy
+ExecStart=/opt/MTProxy/objs/bin/mtproto-proxy -u mtproxy -p ${MTPROXY_ADMIN_PORT} -H ${MTPROXY_CLIENT_PORT} $MTPROXY_BACKEND_SECRET_ARGS $MTPROXY_NAT_ARGS --aes-pwd /etc/mtproxy/proxy-secret /etc/mtproxy/proxy-multi.conf -M ${MTPROXY_WORKERS} -C ${MTPROXY_MAX_CONNECTIONS}
+Restart=on-failure
+RestartSec=3s
+LimitNOFILE=1048576
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectHome=true
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+ReadOnlyPaths=/etc/mtproxy
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
