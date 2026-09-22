@@ -96,23 +96,42 @@ below for what that does and does not cover.
 ### CLI
 
 ```
-tproxy-keys list                                 show every key with its client link
-tproxy-keys add    -name N [-label L] [-mode M]   create a key and apply it
-tproxy-keys revoke -name N                        delete a key and apply
-tproxy-keys rotate -name N                        issue a new secret for an existing key
-tproxy-keys link   -name N                        print the client link for one key
-tproxy-keys status                                service and readiness overview
-tproxy-keys sync                                  rebuild MTProxy secrets from profiles.json
-tproxy-keys serve  [-listen 127.0.0.1:9000]        run the local web panel
-tproxy-keys token                                 print the web panel access token
+tproxy-keys list                                          show every key with its client link
+tproxy-keys add    -name N [-label L] [-group G] [-mode M]   create a key and apply it
+tproxy-keys import -file PATH                             create many keys from a TSV file, one restart total
+tproxy-keys edit   -name N [-label L] [-group G]          change a key's label/group only (no restart)
+tproxy-keys revoke -name N                                delete a key and apply
+tproxy-keys rotate -name N                                issue a new secret for an existing key
+tproxy-keys link   -name N                                print the client link for one key
+tproxy-keys status                                        service and readiness overview
+tproxy-keys sync                                          rebuild MTProxy secrets from profiles.json
+tproxy-keys serve  [-listen 127.0.0.1:9000]               run the local web panel
+tproxy-keys token                                         print the web panel access token
 ```
 
 Carrier modes are the same ones the relay accepts in a profile: `https`
 (default), `https-lanes`, `websocket`, `websocket-lanes`.
 
-`add`, `revoke`, and `rotate` restart `mtproxy` and `tproxy-server`: live
-carrier sessions drop, and clients reconnect on their own within a few
-seconds.
+`add`, `import`, `revoke`, and `rotate` restart `mtproxy` and `tproxy-server`:
+live carrier sessions drop, and clients reconnect on their own within a few
+seconds. `import` applies every line in the file as a single batch — one
+restart for the whole file, not one per key, which is the point of it: adding
+a large existing list (migrating users from a different proxy, or handing one
+person several keys at once) one `add` at a time would mean one restart per
+key, dropping everyone else's session repeatedly for no reason. Each line is
+`name<TAB>label<TAB>group<TAB>mode`; `label`, `group`, and `mode` may be empty
+or omitted entirely.
+
+`edit` only rewrites `/etc/tproxy-keys/meta.json` (label and group) and never
+touches `profiles.json`, so it never restarts anything and never affects a
+live connection — purely how a key is displayed and organized in the panel.
+
+**Group** is free-form text with no format the relay or MTProxy ever sees —
+it exists only so the panel can show which keys belong to the same person.
+The label is expected to fully identify the key itself (who *and* which
+device — "Глеб — телефон"), and the group identifies who's responsible for
+the whole set ("Глеб") so their several keys sort and filter together instead
+of scattering alphabetically by key name.
 
 ### Web UI
 
@@ -200,6 +219,13 @@ sudo tproxy-keys sync
   for separate quotas or routing (as the main README's "Multiple secrets on
   one hostname" section describes) needs manual `profiles.json` and
   `firewall.nft` edits; `tproxy-keys` doesn't manage multiple backends.
+- **Profile count is capped by the relay's own `limits.max_profiles`**
+  (`/etc/tproxy-server/config.json`, defaults to 32 if the field is absent).
+  `tproxy-keys` reads that value itself before every `add`/`import` rather
+  than hardcoding a number, so it can never silently drift from what the
+  relay actually enforces at `-check` — but raising the ceiling itself (for a
+  larger deployment) is still a manual edit to that file, followed by
+  `systemctl restart tproxy-server`.
 
 ## Troubleshooting
 

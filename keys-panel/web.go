@@ -54,6 +54,7 @@ func cmdServe(paths Paths, arguments []string) {
 	mux.HandleFunc("/login", server.handleLogin)
 	mux.HandleFunc("/logout", server.handleLogout)
 	mux.HandleFunc("/keys/add", server.handleAdd)
+	mux.HandleFunc("/keys/edit", server.handleEdit)
 	mux.HandleFunc("/keys/revoke", server.handleRevoke)
 	mux.HandleFunc("/keys/rotate", server.handleRotate)
 	mux.HandleFunc("/panel.css", server.handleCSS)
@@ -206,6 +207,7 @@ func (p *panel) handleIndex(w http.ResponseWriter, r *http.Request) {
 		"CSRF":     current.csrf,
 		"Ready":    p.readyLabel(),
 		"Units":    p.unitStates(),
+		"Groups":   DistinctGroups(p.paths),
 	}
 	if err != nil {
 		data["Error"] = err.Error()
@@ -266,13 +268,43 @@ func (p *panel) handleAdd(w http.ResponseWriter, r *http.Request) {
 	p.mutate(w, r, func(_ *session) (string, error) {
 		name := strings.TrimSpace(r.FormValue("name"))
 		label := strings.TrimSpace(r.FormValue("label"))
+		group := strings.TrimSpace(r.FormValue("group"))
 		mode := strings.TrimSpace(r.FormValue("mode"))
-		profile, err := AddKey(p.paths, name, label, mode)
+		added, err := AddKeys(p.paths, []NewKeyRequest{{Name: name, Label: label, Group: group, Mode: mode}})
 		if err != nil {
 			return "", err
 		}
-		return "Ключ " + profile.Name + " создан, службы перезапущены.", nil
+		return "Ключ " + added[0].Name + " создан, службы перезапущены.", nil
 	})
+}
+
+// handleEdit changes only label/group. It still requires the session and CSRF
+// checks mutate() provides, but - unlike add/revoke/rotate - never touches
+// profiles.json, so it deliberately does not go through mutate's "restarts
+// services" framing: nothing here restarts anything.
+func (p *panel) handleEdit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	_, current := p.lookup(r)
+	if current == nil {
+		http.Redirect(w, r, "/", http.StatusSeeOther)
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(r.FormValue("csrf")), []byte(current.csrf)) != 1 {
+		http.Error(w, "stale form; reload the panel", http.StatusForbidden)
+		return
+	}
+	name := strings.TrimSpace(r.FormValue("name"))
+	label := strings.TrimSpace(r.FormValue("label"))
+	group := strings.TrimSpace(r.FormValue("group"))
+	if err := UpdateKeyMeta(p.paths, name, label, group); err != nil {
+		p.setFlash(current, err.Error(), false)
+	} else {
+		p.setFlash(current, "Метка и группа для "+name+" обновлены.", true)
+	}
+	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
 func (p *panel) handleRevoke(w http.ResponseWriter, r *http.Request) {

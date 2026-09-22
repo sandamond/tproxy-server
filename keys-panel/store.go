@@ -39,6 +39,7 @@ type ProfileFile struct {
 // it is kept beside it and joined by profile name.
 type KeyMeta struct {
 	Label   string `json:"label,omitempty"`
+	Group   string `json:"group,omitempty"`
 	Note    string `json:"note,omitempty"`
 	Created string `json:"created,omitempty"`
 }
@@ -197,8 +198,8 @@ func Apply(p Paths, file *ProfileFile) error {
 	if len(file.Profiles) == 0 {
 		return errors.New("at least one key must remain; the relay refuses an empty profile list")
 	}
-	if len(file.Profiles) > 32 {
-		return errors.New("the relay accepts at most 32 profiles")
+	if limit := maxProfiles(p); len(file.Profiles) > limit {
+		return fmt.Errorf("the relay's configured limits.max_profiles is %d; this would exceed it", limit)
 	}
 	seenName := map[string]bool{}
 	seenSecret := map[string]bool{}
@@ -362,6 +363,31 @@ func PublicHostname(p Paths) string {
 	return config.PublicHostname
 }
 
+// defaultMaxProfiles matches the relay's own Defaults() in
+// internal/config/config.go. It's the fallback when config.json omits
+// limits.max_profiles, which is itself valid — the relay applies this same
+// default in that case.
+const defaultMaxProfiles = 32
+
+// maxProfiles reads limits.max_profiles from the relay's own config so this
+// panel's admission check can never silently drift from what the relay
+// actually enforces at -check time.
+func maxProfiles(p Paths) int {
+	raw, err := os.ReadFile(p.RelayConf)
+	if err != nil {
+		return defaultMaxProfiles
+	}
+	var config struct {
+		Limits struct {
+			MaxProfiles int `json:"max_profiles"`
+		} `json:"limits"`
+	}
+	if json.Unmarshal(raw, &config) != nil || config.Limits.MaxProfiles <= 0 {
+		return defaultMaxProfiles
+	}
+	return config.Limits.MaxProfiles
+}
+
 func ClientLink(host, secret string) string {
 	if host == "" {
 		return ""
@@ -393,10 +419,34 @@ func Keys(p Paths) ([]KeyView, string, error) {
 			CreatedShort: shortTime(entry.Created),
 		})
 	}
+	// Group first so keys belonging to the same person sit together (the
+	// stated point of the field), then by creation order within a group so a
+	// person's own keys stay in the order they were issued.
 	sort.SliceStable(views, func(i, j int) bool {
+		if views[i].Meta.Group != views[j].Meta.Group {
+			return views[i].Meta.Group < views[j].Meta.Group
+		}
 		return views[i].Meta.Created < views[j].Meta.Created
 	})
 	return views, host, nil
+}
+
+// DistinctGroups lists every group currently in use, for the web UI's
+// autocomplete — free text stays free text, this just reduces accidental
+// near-duplicates like "Глеб" vs "глеб".
+func DistinctGroups(p Paths) []string {
+	meta := LoadMeta(p)
+	seen := map[string]bool{}
+	var groups []string
+	for _, entry := range meta.Keys {
+		if entry.Group == "" || seen[entry.Group] {
+			continue
+		}
+		seen[entry.Group] = true
+		groups = append(groups, entry.Group)
+	}
+	sort.Strings(groups)
+	return groups
 }
 
 // shortTime renders a stored RFC3339 stamp as a compact local-looking date; an
@@ -412,39 +462,113 @@ func shortTime(value string) string {
 	return parsed.Format("2006-01-02 15:04") + " UTC"
 }
 
+// NewKeyRequest is one profile to create. Group is optional free text (see
+// KeyMeta.Group) so a batch of keys handed to one person can be identified
+// together without constraining what a name or label may contain.
+type NewKeyRequest struct {
+	Name  string
+	Label string
+	Group string
+	Mode  string
+}
+
 func AddKey(p Paths, name, label, mode string) (Profile, error) {
+	added, err := AddKeys(p, []NewKeyRequest{{Name: name, Label: label, Mode: mode}})
+	if err != nil {
+		return Profile{}, err
+	}
+	return added[0], nil
+}
+
+// AddKeys creates one or more profiles in a single Apply() — one relay and
+// MTProxy restart for the whole batch, not one per key. This is what makes
+// importing a large existing list (many names at once, e.g. migrating off a
+// different proxy) practical: 57 individual `add` calls would mean 57
+// restarts, each dropping every other family member's live session too.
+func AddKeys(p Paths, requests []NewKeyRequest) ([]Profile, error) {
+	if len(requests) == 0 {
+		return nil, errors.New("no keys requested")
+	}
 	file, err := LoadProfiles(p)
 	if err != nil {
-		return Profile{}, err
+		return nil, err
 	}
-	if !nameRE.MatchString(name) {
-		return Profile{}, fmt.Errorf("name %q: use 1-64 characters from a-z A-Z 0-9 . _ -", name)
-	}
+	existing := map[string]bool{}
 	for _, profile := range file.Profiles {
-		if profile.Name == name {
-			return Profile{}, fmt.Errorf("a key named %q already exists", name)
-		}
-	}
-	if !validCarrier(mode) {
-		return Profile{}, fmt.Errorf("carrier mode must be one of %s", carrierModes)
-	}
-	secret, err := NewSecret()
-	if err != nil {
-		return Profile{}, err
+		existing[profile.Name] = true
 	}
 	backend := "127.0.0.1:2398"
 	if len(file.Profiles) > 0 {
 		backend = file.Profiles[0].Backend
 	}
-	added := Profile{Name: name, Secret: secret, Backend: backend, CarrierMode: mode}
-	file.Profiles = append(file.Profiles, added)
-	if err := Apply(p, file); err != nil {
-		return Profile{}, err
+
+	seenInBatch := map[string]bool{}
+	added := make([]Profile, 0, len(requests))
+	for _, request := range requests {
+		name := strings.TrimSpace(request.Name)
+		if !nameRE.MatchString(name) {
+			return nil, fmt.Errorf("name %q: use 1-64 characters from a-z A-Z 0-9 . _ -", name)
+		}
+		if existing[name] || seenInBatch[name] {
+			return nil, fmt.Errorf("a key named %q already exists", name)
+		}
+		if !validCarrier(request.Mode) {
+			return nil, fmt.Errorf("key %q: carrier mode must be one of %s", name, carrierModes)
+		}
+		seenInBatch[name] = true
+		secret, err := NewSecret()
+		if err != nil {
+			return nil, err
+		}
+		added = append(added, Profile{Name: name, Secret: secret, Backend: backend, CarrierMode: request.Mode})
 	}
+
+	file.Profiles = append(file.Profiles, added...)
+	if err := Apply(p, file); err != nil {
+		return nil, err
+	}
+
 	meta := LoadMeta(p)
-	meta.Keys[name] = KeyMeta{Label: label, Created: time.Now().UTC().Format(time.RFC3339)}
+	now := time.Now().UTC().Format(time.RFC3339)
+	for i, request := range requests {
+		meta.Keys[added[i].Name] = KeyMeta{
+			Label:   strings.TrimSpace(request.Label),
+			Group:   strings.TrimSpace(request.Group),
+			Created: now,
+		}
+	}
 	_ = SaveMeta(p, meta)
 	return added, nil
+}
+
+// UpdateKeyMeta changes only a key's panel-owned bookkeeping (label, group).
+// Unlike Add/Revoke/Rotate this never touches profiles.json, so it never
+// restarts the relay or MTProxy and never affects a live connection - it's
+// purely how this key is displayed and organized in the panel.
+func UpdateKeyMeta(p Paths, name, label, group string) error {
+	file, err := LoadProfiles(p)
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, profile := range file.Profiles {
+		if profile.Name == name {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("no key named %q", name)
+	}
+	meta := LoadMeta(p)
+	entry := meta.Keys[name]
+	entry.Label = strings.TrimSpace(label)
+	entry.Group = strings.TrimSpace(group)
+	if entry.Created == "" {
+		entry.Created = time.Now().UTC().Format(time.RFC3339)
+	}
+	meta.Keys[name] = entry
+	return SaveMeta(p, meta)
 }
 
 func RevokeKey(p Paths, name string) error {
