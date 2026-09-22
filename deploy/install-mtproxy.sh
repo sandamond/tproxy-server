@@ -12,7 +12,7 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl build-essential libssl-dev util-linux zlib1g-dev
+apt-get install -y --no-install-recommends ca-certificates curl build-essential iproute2 libssl-dev util-linux zlib1g-dev
 
 if ! id mtproxy >/dev/null 2>&1; then
 	useradd --system --home /nonexistent --shell /usr/sbin/nologin mtproxy
