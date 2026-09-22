@@ -7,7 +7,7 @@ import (
 )
 
 func TestRenderUsesNonceAndConfiguredBatch(t *testing.T) {
-	page, err := Render("proxy.example.com", "bootstrap-token", "https", 2*1024*1024)
+	page, err := Render("proxy.example.com", "", "bootstrap-token", "https", 2*1024*1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -21,7 +21,7 @@ func TestRenderUsesNonceAndConfiguredBatch(t *testing.T) {
 	if !strings.Contains(body, "queueItemLimit=16384") || !strings.Contains(body, "setTimeout(abort,90000)") {
 		t.Fatal("rendered bridge omitted its item or request bound")
 	}
-	if !strings.Contains(body, "fetch(relayOrigin+path,requestOptions)") ||
+	if !strings.Contains(body, "fetch(relayBase+path,requestOptions)") ||
 		!strings.Contains(body, "mode:'same-origin',credentials:'omit'") ||
 		!strings.Contains(body, "cache:'no-store',redirect:'error',referrerPolicy:'no-referrer'") {
 		t.Fatal("rendered bridge omitted its same-origin request restrictions")
@@ -59,7 +59,7 @@ func TestRenderUsesNonceAndConfiguredBatch(t *testing.T) {
 }
 
 func TestRenderUsesHardenedExecutionPolicy(t *testing.T) {
-	page, err := Render("proxy.example.com", "bootstrap-token", "https", 2*1024*1024)
+	page, err := Render("proxy.example.com", "", "bootstrap-token", "https", 2*1024*1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,10 +117,10 @@ func TestRenderUsesHardenedExecutionPolicy(t *testing.T) {
 }
 
 func TestRenderRejectsInvalidBatch(t *testing.T) {
-	if _, err := Render("proxy.example.com", "bootstrap-token", "https", 0); err == nil {
+	if _, err := Render("proxy.example.com", "", "bootstrap-token", "https", 0); err == nil {
 		t.Fatal("accepted a nonpositive carrier batch")
 	}
-	if _, err := Render("proxy.example.com", "bootstrap-token", "invalid", 2*1024*1024); err == nil {
+	if _, err := Render("proxy.example.com", "", "bootstrap-token", "invalid", 2*1024*1024); err == nil {
 		t.Fatal("accepted an invalid carrier mode")
 	}
 }
@@ -132,7 +132,7 @@ func TestRenderIncludesSelectableCarrierImplementations(t *testing.T) {
 		"websocket",
 		"websocket-lanes",
 	} {
-		page, err := Render("proxy.example.com", "bootstrap-token", mode, 2*1024*1024)
+		page, err := Render("proxy.example.com", "", "bootstrap-token", mode, 2*1024*1024)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -159,7 +159,7 @@ func TestRenderIncludesSelectableCarrierImplementations(t *testing.T) {
 }
 
 func TestRenderedBridgeSurvivesTheRestrictedProfile(t *testing.T) {
-	page, err := Render("proxy.example.com", "bootstrap-token", "https", 2*1024*1024)
+	page, err := Render("proxy.example.com", "", "bootstrap-token", "https", 2*1024*1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func TestRenderedBridgeSurvivesTheRestrictedProfile(t *testing.T) {
 }
 
 func TestRenderedBridgeAvailabilityFixes(t *testing.T) {
-	page, err := Render("proxy.example.com", "bootstrap-token", "https-lanes", 2*1024*1024)
+	page, err := Render("proxy.example.com", "", "bootstrap-token", "https-lanes", 2*1024*1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func TestRenderedBridgeAvailabilityFixes(t *testing.T) {
 		// A failing bridge tells the relay, and a session created after close
 		// is deleted, so slots are not pinned for the whole reconnect grace.
 		"status('failed');\n if(port)port.postMessage({t:'close'});\n close(true);",
-		"if(closed){fetch(relayOrigin+'/api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});return}",
+		"if(closed){fetch(relayBase+'api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});return}",
 		// Late DATA/WINDOW/CLOSE for a lane the bridge no longer knows is
 		// dropped instead of killing the carrier.
 		"if(!lane&&(value.type===2||value.type===3||value.type===4))return;",
@@ -225,13 +225,13 @@ func TestRenderedBridgeAvailabilityFixes(t *testing.T) {
 }
 
 func TestRenderRejectsInvalidHostnameAndOversizedBatch(t *testing.T) {
-	if _, err := Render("Proxy.Example.com", "bootstrap-token", "https", 2*1024*1024); err == nil {
+	if _, err := Render("Proxy.Example.com", "", "bootstrap-token", "https", 2*1024*1024); err == nil {
 		t.Fatal("accepted a non-canonical hostname")
 	}
-	if _, err := Render("proxy.example.com/x", "bootstrap-token", "https", 2*1024*1024); err == nil {
+	if _, err := Render("proxy.example.com/x", "", "bootstrap-token", "https", 2*1024*1024); err == nil {
 		t.Fatal("accepted a hostname with a path")
 	}
-	if _, err := Render("proxy.example.com", "bootstrap-token", "https", 2*1024*1024+1); err == nil {
+	if _, err := Render("proxy.example.com", "", "bootstrap-token", "https", 2*1024*1024+1); err == nil {
 		t.Fatal("accepted a carrier batch above the desktop loopback cap")
 	}
 }

@@ -19,8 +19,11 @@ type Page struct {
 
 const PermissionsPolicy = "accelerometer=(), autoplay=(), camera=(), clipboard-read=(), clipboard-write=(), display-capture=(), encrypted-media=(), fullscreen=(), geolocation=(), gyroscope=(), hid=(), idle-detection=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(), publickey-credentials-create=(), publickey-credentials-get=(), screen-wake-lock=(), serial=(), usb=(), web-share=(), xr-spatial-tracking=()"
 
-func Render(hostname, bootstrapToken, carrierMode string, batchBytes int) (Page, error) {
+func Render(hostname, basePath, bootstrapToken, carrierMode string, batchBytes int) (Page, error) {
 	if err := config.ValidateHostname(hostname); err != nil {
+		return Page{}, err
+	}
+	if err := config.ValidateBasePath(basePath); err != nil {
 		return Page{}, err
 	}
 	if batchBytes <= 0 || batchBytes > config.MaxCarrierBatchBytes {
@@ -34,15 +37,15 @@ func Render(hostname, bootstrapToken, carrierMode string, batchBytes int) (Page,
 		return Page{}, err
 	}
 	nonce := base64.RawURLEncoding.EncodeToString(nonceBytes)
-	hostJSON, _ := json.Marshal("https://" + hostname)
+	baseJSON, _ := json.Marshal("https://" + hostname + config.Base(basePath))
 	tokenJSON, _ := json.Marshal(bootstrapToken)
 	carrierJSON, _ := json.Marshal(carrierMode)
 	body := strings.ReplaceAll(document, "__NONCE__", nonce)
-	body = strings.ReplaceAll(body, "__ORIGIN__", string(hostJSON))
+	body = strings.ReplaceAll(body, "__RELAY_BASE__", string(baseJSON))
 	body = strings.ReplaceAll(body, "__BOOTSTRAP__", string(tokenJSON))
 	body = strings.ReplaceAll(body, "__CARRIER_MODE__", string(carrierJSON))
 	body = strings.ReplaceAll(body, "__BATCH_LIMIT__", strconv.Itoa(batchBytes))
-	if strings.Contains(body, "__NONCE__") || strings.Contains(body, "__ORIGIN__") || strings.Contains(body, "__BOOTSTRAP__") || strings.Contains(body, "__CARRIER_MODE__") || strings.Contains(body, "__BATCH_LIMIT__") {
+	if strings.Contains(body, "__NONCE__") || strings.Contains(body, "__RELAY_BASE__") || strings.Contains(body, "__BOOTSTRAP__") || strings.Contains(body, "__CARRIER_MODE__") || strings.Contains(body, "__BATCH_LIMIT__") {
 		return Page{}, errors.New("bridge template replacement failed")
 	}
 	return Page{
@@ -80,7 +83,7 @@ const document = `<!doctype html>
 <script nonce="__NONCE__">
 (()=>{
 'use strict';
-const relayOrigin=__ORIGIN__,bootstrap=__BOOTSTRAP__,carrierMode=__CARRIER_MODE__;
+const relayBase=__RELAY_BASE__,bootstrap=__BOOTSTRAP__,carrierMode=__CARRIER_MODE__;
 const fragment=location.hash,androidNonce=/^#android=([A-Za-z0-9_-]{43})$/.exec(fragment)?.[1]||'';
 history.replaceState(null,'',location.pathname);
 let initialized=false,closed=false,port=null,sessionToken='',createStarted=false;
@@ -176,7 +179,7 @@ async function request(path,makeOptions){
   const timer=setTimeout(abort,90000);
   let wait=0,serviceUnavailable=false;
   try{
-   const response=await fetch(relayOrigin+path,requestOptions);
+   const response=await fetch(relayBase+path,requestOptions);
    if(response.status!==503)return response;
    serviceUnavailable=true;wait=retryAfterMs(response);
    await response.arrayBuffer();
@@ -198,15 +201,15 @@ function fail(){
 async function createSession(first){
  try{
   status('connecting');
-  const response=await request('/api/v1/session',()=>options('POST',bootstrap,first));
+  const response=await request('api/v1/session',()=>options('POST',bootstrap,first));
   if(response.status!==200||response.headers.get('X-Carrier-Mode')!==carrierMode)throw new Error('session creation rejected');
   sessionToken=response.headers.get('X-Session-Token')||'';
   downCursor=response.headers.get('X-Down-Cursor')||'0';
   if(!sessionToken)throw new Error('missing session token');
-  if(closed){fetch(relayOrigin+'/api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});return}
+  if(closed){fetch(relayBase+'api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});return}
   const welcome=await response.arrayBuffer();
   if(carrierMode==='websocket')await openWebSocket();
-  if(closed){fetch(relayOrigin+'/api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});return}
+  if(closed){fetch(relayBase+'api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});return}
   port.postMessage(welcome,[welcome]);
   status('connected');
   for(const data of pending.splice(0)){release(data.byteLength,1,null);queueCarrier(data)}
@@ -232,7 +235,7 @@ async function runUp(){
  try{
   while(!closed&&sessionToken&&upPending.length){
    const batch=joinPending(upPending,null),sequence=String(upSequence);
-   const response=await request('/api/v1/up',()=>options('POST',sessionToken,batch.body,{'X-Up-Seq':sequence}));
+   const response=await request('api/v1/up',()=>options('POST',sessionToken,batch.body,{'X-Up-Seq':sequence}));
    if(response.status!==204||response.headers.get('X-Up-Ack')!==sequence)throw new Error('uplink rejected');
    release(batch.total,batch.count,null);port.postMessage({t:'traffic',up:batch.total,down:0});upSequence++;
   }
@@ -243,7 +246,7 @@ async function poll(){
  while(!closed&&sessionToken){
   try{
    pollController=new AbortController();
-   const response=await request('/api/v1/down',()=>options('POST',sessionToken,null,{'X-Down-Cursor':downCursor},pollController.signal));
+   const response=await request('api/v1/down',()=>options('POST',sessionToken,null,{'X-Down-Cursor':downCursor},pollController.signal));
    if(response.status===204){status('connected');continue}
    if(response.status!==200)throw new Error('downlink rejected');
    const next=response.headers.get('X-Down-Cursor')||'',data=await response.arrayBuffer();
@@ -278,7 +281,7 @@ async function runLaneUp(lane){
  try{
   while(!closed&&sessionToken&&lane.pending.length){
    const batch=joinPending(lane.pending,lane),sequence=String(lane.sequence),laneID=String(lane.id);
-   const response=await request('/api/v1/up',()=>options('POST',sessionToken,batch.body,{'X-Up-Seq':sequence,'X-Lane-ID':laneID}));
+   const response=await request('api/v1/up',()=>options('POST',sessionToken,batch.body,{'X-Up-Seq':sequence,'X-Lane-ID':laneID}));
    if(response.status!==204||response.headers.get('X-Up-Ack')!==sequence)throw new Error('lane uplink rejected');
    release(batch.total,batch.count,lane);port.postMessage({t:'traffic',up:batch.total,down:0});lane.sequence++;
    if(!lane.polling)pollLane(lane);
@@ -293,7 +296,7 @@ async function pollLane(lane){
   while(!closed&&sessionToken&&lanes.get(lane.id)===lane){
    const controller=new AbortController(),laneID=String(lane.id);
    lane.controller=controller;
-   const response=await request('/api/v1/down',()=>options('POST',sessionToken,null,{'X-Down-Cursor':lane.cursor,'X-Lane-ID':laneID},controller.signal));
+   const response=await request('api/v1/down',()=>options('POST',sessionToken,null,{'X-Down-Cursor':lane.cursor,'X-Lane-ID':laneID},controller.signal));
    if(response.status===204){
     if(response.headers.get('X-Lane-Closed')==='1'){lanes.delete(lane.id);rememberLaneClosed(lane.id);return}
     status('connected');continue;
@@ -310,7 +313,7 @@ async function pollLane(lane){
 }
 function openWebSocket(){
  return new Promise((resolve,reject)=>{
-  const target=relayOrigin.replace(/^https:/,'wss:')+'/api/v1/ws',socket=new WebSocket(target,'tproxy-v1.'+sessionToken);
+  const target=relayBase.replace(/^https:/,'wss:')+'api/v1/ws',socket=new WebSocket(target,'tproxy-v1.'+sessionToken);
   webSocket=socket;socket.binaryType='arraybuffer';
   socket.onopen=()=>resolve();
   socket.onmessage=event=>{
@@ -351,7 +354,7 @@ function finishWebSocketLane(lane,notify){
  if(notify&&port&&!closed){const frame=closeFrame(lane.id);port.postMessage(frame,[frame])}
 }
 function openWebSocketLane(lane){
- const target=relayOrigin.replace(/^https:/,'wss:')+'/api/v1/ws';
+ const target=relayBase.replace(/^https:/,'wss:')+'api/v1/ws';
  const socket=new WebSocket(target,'tproxy-lane-v1.'+sessionToken+'.'+lane.id);
  lane.socket=socket;socket.binaryType='arraybuffer';
  socket.onopen=()=>{if(closed||lane.finished){socket.close();return}lane.opened=true;status('connected');runWebSocketLaneUp(lane)};
@@ -375,6 +378,7 @@ function queueWebSocketLane(value){
  if(!value.id||(!lane&&closedLanes.has(value.id)))throw new Error('closed lane was reused');
  if(!lane&&value.type!==1)throw new Error('lane did not begin with OPEN');
  lane=lane||ensureLane(value.id);
+ if(value.type===3&&!lane.opened){finishWebSocketLane(lane,false);return}
  if(!reserve(value.data,lane)){fail();return}
  lane.pending.push(value.data);if(value.type===3)lane.localClosed=true;
  if(!lane.socket)openWebSocketLane(lane);else runWebSocketLaneUp(lane);
@@ -403,7 +407,7 @@ function close(notifyServer){
  }
  if(webSocketTimer)clearTimeout(webSocketTimer);
  if(webSocket)webSocket.close();
- if(notifyServer&&sessionToken)fetch(relayOrigin+'/api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});
+ if(notifyServer&&sessionToken)fetch(relayBase+'api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).catch(()=>{});
  if(port)port.close();
 }
 function activatePort(nextPort){

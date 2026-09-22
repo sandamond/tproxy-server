@@ -206,6 +206,30 @@ port because WEB always uses HTTPS on 443, and it has no username or password.
 Clients also accept `tg://webproxy?server=...&secret=...`; `host` is accepted as a
 legacy input alias, but generated links always use `server`.
 
+The link secret is derived from the MTProxy secret in `profiles.json`:
+
+```text
+root deployment : secret          -> the plain hex, unchanged
+base path       : 0x70 || secret  -> unpadded base64url
+```
+
+```bash
+# the exact derivation deploy/install.sh performs
+{ printf '\x70'; printf "$(printf %s "$secret" | sed 's/../\\x&/g')"; } \
+  | base64 | tr '+/' '-_' | tr -d '=\n'
+# 8561944064fc730cbfa4473562d8ec59 -> cIVhlEBk_HMMv6RHNWLY7Fk
+```
+
+A client decodes it by the inverse rule: base64url-decode, and if the result is
+at least 17 bytes and begins with `0x70`, strip that byte and use the rest as the
+MTProxy secret; otherwise use the value as it stands. This is unambiguous because
+a canonical secret is 16 bytes, 17 beginning with `0xDD`, or 21+ beginning with
+`0xEE`. A link that carries a base path **must** use the marked form — an unmarked
+secret there is rejected, so that no link exists which an older client would
+silently accept as a pathless proxy on an empty host. Never use `0xDD` as the
+marker: an older parser reads a 17-byte secret beginning with it as an ordinary
+padded secret and accepts the link.
+
 The Android client validates and canonicalizes both fields before treating the URL
 as a proxy link. Its confirmation sheet displays only the address and secret, with
 no independent status check, and starts the foreground WebView carrier only after

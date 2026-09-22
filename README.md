@@ -16,8 +16,8 @@ Telegram Desktop implementation, an experimental Android client described in
 the same bridge page, carrier selection, shared frame format, and server deployment.
 
 The configured hostname remains a regular HTTPS website. A capability derived from
-the hostname and MTProxy secret selects a one-shot bridge page; every other normal
-request receives the public site.
+the hostname and MTProxy secret selects a one-shot bridge page. Requests without
+authentic relay credentials receive the public site.
 
 ## How it works
 
@@ -69,7 +69,7 @@ official MTProxy client port, and MTProxy statistics remain local. The relay nev
 receives a client-selected backend address and never decrypts the MTProxy stream.
 
 Caddy proxies **every** path to the relay. In static mode the relay serves the
-whole site from memory through one code path and one header set. In application
+whole site from memory using standard Go conditional and range handling. In application
 mode it delegates ordinary and unauthenticated requests to one private loopback
 web application. A request that proves knowledge of a bridge or session token is
 intercepted before that application. In either mode there is no separately hosted
@@ -128,20 +128,22 @@ entered in every client that uses this server and passed to the installer.
 
 The repository deliberately does not include a deployable public website. If many
 operators installed the same starter, its body and assets would become an easy
-active-probing signature. The simplest choice is a static site that genuinely
-belongs to the operator, with generated files in a directory such as `../my-site`.
+active-probing signature. The recommended choice is a real loopback website or
+stock static server configured with `public_upstream`. The in-process `public_dir`
+mode remains available for simple sites.
 
 The only required file is `index.html`. A several-page site will normally also
 have `about.html`, `privacy.html`, `404.html`, `styles.css`, a favicon, and images.
-The relay supports clean links such as `/about` for `about.html`; no framework or
-build step is required. See [`PUBLIC_SITE.md`](PUBLIC_SITE.md) for the complete
+Use exact links such as `/about.html`, or explicitly select `static_routes: "legacy"`
+for extensionless aliases. Old configs retain those aliases for compatibility. See [`PUBLIC_SITE.md`](PUBLIC_SITE.md) for the complete
 package contract and a prompt suitable for a site generator.
 
 For a database-backed site, accounts, forms, server rendering, an existing CMS,
 site APIs, SSE, or WebSockets, run any HTTP application on a numeric loopback
 address such as `127.0.0.1:3000`. The relay can use it as `public_upstream` while
 remaining the only public gateway. The application owns its framework, headers,
-cookies, and persistence; four exact transport paths remain reserved. This mode
+cookies, and persistence; unauthenticated requests on transport paths reach the
+application unchanged apart from normal HTTP proxy semantics. This mode
 is specified in [`PUBLIC_SITE.md`](PUBLIC_SITE.md).
 
 ## 3. Configure the hosting firewall
@@ -247,6 +249,28 @@ Expected listeners are public Caddy on 80/443 and loopback relay listeners on
 8080/8081. Official MTProxy listens on 2398 because its upstream command has no bind
 address option; nftables must drop that port on every non-loopback interface.
 
+Confirm MTProxy is actually reaching Telegram, not merely listening. Its
+middle-end connections must stay up:
+
+```bash
+journalctl -u mtproxy --since -5min | grep -c 'Disconnected from RPC Middle-End'
+```
+
+A steady stream of those lines means MTProxy is announcing an address Telegram
+does not see it arrive from, which happens whenever the host is behind 1:1 NAT
+(EC2, GCE, a container bridge). MTProxy derives the AES keys for its middle-end
+session from its own source address, so the two sides derive different keys and
+every middle-end connection is dropped right after the handshake. This failure is
+silent from the outside: clients still complete the obfuscated2 handshake against
+the proxy, the relay still accepts streams and grants `WINDOW`, and every stream
+then stalls forever with no error on any layer. `install.sh` detects NAT and sets
+`MTPROXY_NAT_ARGS` for you; set it by hand if the public address changes:
+
+```bash
+# in /etc/mtproxy/mtproxy.env
+MTPROXY_NAT_ARGS=--nat-info 10.0.0.5:203.0.113.7
+```
+
 From your own computer, verify the site and certificate:
 
 ```bash
@@ -283,20 +307,64 @@ client derives it in memory.
 A WEB-capable Telegram app accepts exactly two user-visible values:
 
 ```text
-Hostname: proxy.example.com
-Secret:   000102030405060708090a0b0c0d0e0f
+Proxy server: proxy.example.com
+Proxy secret: 000102030405060708090a0b0c0d0e0f
 ```
 
-The hostname field contains no `https://`, port, slash, query, or fragment. HTTPS
-and port 443 are fixed by the WEB proxy type. Internationalized domains are stored
-as lowercase ASCII IDNA A-labels. The secret is the same client-facing MTProxy
-secret configured in the corresponding server profile.
+The server is the hostname, plus the base path when one is configured, as in
+`proxy.example.com/phcf2vfe7zgbrslg`. It contains no `https://`, port, query, or
+fragment. HTTPS and port 443 are fixed by the WEB proxy type. Internationalized
+domains are stored as lowercase ASCII IDNA A-labels.
+
+The proxy secret above is the plain hex of the client-facing MTProxy secret in the
+corresponding server profile. Typed by hand it keeps that form even under a base
+path, because the user supplies the path in the server field and nothing is
+ambiguous. A shared *link* is the one place the secret changes form: under a base
+path it must carry the marked value derived below, so the installer prints the two
+under separate labels and neither is pasted in the other's place.
 
 A shareable WEB proxy link is:
 
 ```text
 https://t.me/webproxy?server=proxy.example.com&secret=000102030405060708090a0b0c0d0e0f
 ```
+
+With a base path the address is percent-encoded into the same `server` parameter
+and the secret changes form, so `deploy/install.sh` prints the internal secret and
+the client-facing one under separate labels, plus the finished link:
+
+```text
+Internal mtproxy secret: 8561944064fc730cbfa4473562d8ec59
+Proxy server:            proxy.example.com/phcf2vfe7zgbrslg
+Proxy secret:            cIVhlEBk_HMMv6RHNWLY7Fk
+Proxy link:              https://t.me/webproxy?server=proxy.example.com%2Fphcf2vfe7zgbrslg&secret=cIVhlEBk_HMMv6RHNWLY7Fk
+```
+
+The proxy secret is derived from the MTProxy secret in `profiles.json`:
+
+```text
+root deployment : secret          -> the plain hex, unchanged
+base path       : 0x70 || secret  -> unpadded base64url
+```
+
+```bash
+# the exact derivation deploy/install.sh performs
+{ printf '\x70'; printf "$(printf %s "$secret" | sed 's/../\\x&/g')"; } \
+  | base64 | tr '+/' '-_' | tr -d '=\n'
+# 8561944064fc730cbfa4473562d8ec59 -> cIVhlEBk_HMMv6RHNWLY7Fk
+```
+
+A client decodes it by the inverse rule: base64url-decode, and if the result is
+at least 17 bytes and begins with `0x70`, strip that byte and use the rest as the
+MTProxy secret; otherwise use the value as it stands. This is unambiguous because
+a canonical secret is 16 bytes, 17 beginning with `0xDD`, or 21+ beginning with
+`0xEE`. A link that carries a base path **must** use the marked form — an unmarked
+secret there is rejected, so that no link exists which an older client would
+silently accept as a pathless proxy on an empty host. Never use `0xDD` as the
+marker: an older parser reads a 17-byte secret beginning with it as an ordinary
+padded secret and accepts the link.
+
+There is no separate path parameter; see [BASE_PATH.md](BASE_PATH.md).
 
 Clients may also accept the equivalent `tg://webproxy` form. The public `t.me`
 frontend does not yet register this route, so proof-of-concept testing may require
@@ -340,13 +408,23 @@ web application as described in [`PUBLIC_SITE.md`](PUBLIC_SITE.md), then create
 `config.example.json` and `profiles.example.json`. When not using systemd
 `LoadCredential`, point `profiles_file` directly at the mode-restricted file. Both
 relay listeners, the public application, and every backend address must use
-numeric loopback addresses.
+numeric loopback addresses. Provision the persistent signing key once (the
+`tproxy` service user and `/etc/tproxy-server` must already exist):
+
+```bash
+sudo bash deploy/ensure-token-key.sh
+```
+
+Keep `/etc/tproxy-server/token.key` backed up, private, and unchanged across
+restarts. `token_key_file` defaults to `token.key` next to the server config. A
+missing or permissive key fails startup; no ephemeral key is silently generated.
 
 Build the official backend with `deploy/install-mtproxy.sh`, install the supplied
 systemd units, and let the relay serve the whole hostname:
 
 ```caddyfile
 encode zstd gzip
+header -Via
 reverse_proxy 127.0.0.1:8080 {
   transport http {
     response_header_timeout 40s
@@ -386,6 +464,14 @@ their network behavior is unspecified.
 Keep the bridge response headers produced by the Go relay intact; `PROTOCOL.md`
 lists the complete execution policy and explains which restrictions clients must
 also enforce independently.
+
+## Running alongside an existing website
+
+The layout above gives the relay a hostname of its own and routes every path to
+it. To put a relay on a domain that already serves a real site, or simply to move
+the carrier off well-known root paths, configure a base path and route only that
+prefix to the relay. [BASE_PATH.md](BASE_PATH.md) covers the two deployment modes,
+the nginx and Caddy front-proxy configuration, slug generation, and rollout.
 
 ## Multiple secrets on one hostname
 
@@ -434,6 +520,16 @@ client secret, and numeric loopback backend:
 The mode is selected through the secret/profile, so existing Desktop, Android, and
 iOS proof-of-concept clients need no new setting or client-side transport code. Use
 different secrets when exposing several modes on one hostname.
+
+macOS WebKit can serialize WebSocket handshakes to the same host. With
+`websocket-lanes`, a burst of main, media, and connection-test streams can therefore
+take longer to open than the client's connection timeout. The bridge cancels a
+pending handshake when the client closes that stream, but each remaining lane
+still needs its own handshake. If connection establishment is slow or media
+streams keep reconnecting, use `"carrier_mode": "websocket"` in the affected
+profile in `/etc/tproxy-server/profiles.json`, then run
+`sudo systemctl restart tproxy-server`. Clients reconnect using the new mode with
+the same hostname and secret; the public website configuration needs no change.
 
 Run one official MTProxy process and listener per profile when profiles need
 separate quotas or routing. Extend `firewall.nft` to include every added backend
@@ -578,10 +674,22 @@ trust model for why a self-hosted runner is safe to use here despite this being 
 public repository - read it before changing anything under `.github/workflows/` or
 `deploy/ci-deploy.sh`.
 
-This script intentionally does not replace configuration, systemd units, Caddy,
-MTProxy, firewall rules, or public-site files. Running the complete automated
+The updater provisions a missing default `token.key` without changing existing
+config JSON, so an older binary can still be restored. On that first migration it
+also installs a dedicated systemd environment drop-in to drain legacy tokens
+safely. Remove the drop-in once existing clients have reloaded, as described in
+[HARDENING.md](HARDENING.md), to enable complete public pass-through. Existing key
+bytes are preserved. For a custom `token_key_file`, provision that path and arrange
+legacy draining separately.
+
+Apart from the first-migration drop-in, this script does not replace configuration,
+systemd units, Caddy, MTProxy, firewall rules, or public-site files. Running the complete automated
 installer again preserves an existing site directory but replaces the single-profile
 config and active Caddyfile, so use it deliberately.
+
+The probing-hardening change also has a separate Caddy migration; see
+[HARDENING.md](HARDENING.md) for the reviewed changes, token rollout limitations,
+and verification commands. Do not rerun the full installer just to update Caddy.
 
 When an update includes reviewed changes to the supplied relay or MTProxy unit,
 install those units separately and then restart the affected services:
@@ -606,12 +714,24 @@ when overriding the defaults.
   record rather than leaving IPv6 half-configured.
 - **`/readyz` returns 503:** inspect `systemctl status mtproxy`, then confirm a local
   TCP connection to `127.0.0.1:2398` and the downloaded files under `/etc/mtproxy`.
+  A successful TCP connection to that port proves only that MTProxy is listening.
+  It accepts every connection, including a bogus 64-byte header, and holds bad
+  ones open on purpose to resist active probing, so reachability is not health.
 - **The WebView shows the public site instead of connecting:** hostname and secret
   must match the server profile exactly; the client derives a different capability
   for every hostname/secret pair.
 - **The client remains in its connecting state:** confirm the WebView can load the
   exact HTTPS hostname, then use the platform-specific client document for native
   bridge, lifecycle, and fallback diagnostics.
+- **The client connects, the bridge and session work, and every stream then goes
+  quiet:** this is the NAT failure described in section 5, and it is the only
+  failure that produces no error anywhere. Streams reach `WINDOW` because the
+  relay really did write to MTProxy; MTProxy is the layer that answers nobody.
+  Check `journalctl -u mtproxy | grep 'Disconnected from RPC Middle-End'` and set
+  `MTPROXY_NAT_ARGS` in `/etc/mtproxy/mtproxy.env`. To isolate the backend from
+  the relay, drive `127.0.0.1:2398` directly with a client that performs the
+  obfuscated2 handshake and one `req_pq`: a healthy MTProxy returns `resPQ`
+  within a few hundred milliseconds.
 - **The public site works but the bridge fails:** inspect only sanitized service
   status and metrics. Never log bridge URLs or authorization headers.
 - **Configuration check fails on permissions:** the profiles file must have no group

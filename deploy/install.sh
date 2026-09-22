@@ -3,24 +3,28 @@ set -euo pipefail
 umask 077
 
 hostname=
+base_path=
 secret=
 email=
 site_dir=
 site_upstream=
+static_routes=exact
 mtproxy_workers=1
 mtproxy_max_connections=4096
 
 usage() {
-	echo "usage: sudo ./deploy/install.sh --hostname proxy.example.com --email admin@example.com [--site-dir DIR | --site-upstream URL] [--secret 32-or-34-hex] [--mtproxy-workers 1] [--mtproxy-max-connections 4096]" >&2
+	echo "usage: sudo ./deploy/install.sh --hostname proxy.example.com --email admin@example.com [--site-dir DIR | --site-upstream URL] [--base-path SLUG|none] [--static-routes exact|legacy] [--secret 32-or-34-hex] [--mtproxy-workers 1] [--mtproxy-max-connections 4096]" >&2
 }
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--hostname) hostname="${2:-}"; shift 2 ;;
+		--base-path) base_path="${2:-}"; shift 2 ;;
 		--secret) secret="${2:-}"; shift 2 ;;
 		--email) email="${2:-}"; shift 2 ;;
 		--site-dir) site_dir="${2:-}"; shift 2 ;;
 		--site-upstream) site_upstream="${2:-}"; shift 2 ;;
+		--static-routes) static_routes="${2:-}"; shift 2 ;;
 		--mtproxy-workers) mtproxy_workers="${2:-}"; shift 2 ;;
 		--mtproxy-max-connections) mtproxy_max_connections="${2:-}"; shift 2 ;;
 		*) usage; exit 2 ;;
@@ -38,6 +42,33 @@ fi
 if [[ -z "$secret" ]]; then
 	read -r -s -p "WEB proxy secret (32 hex, optionally prefixed with dd): " secret
 	echo
+fi
+# A new deployment gets a fresh 128-bit slug, so its carrier stays off
+# well-known root paths by default. "none" selects the host root, which is what
+# every installation made before base paths existed serves.
+if [[ "$base_path" == "none" ]]; then
+	base_path=
+elif [[ -z "$base_path" ]]; then
+	if [[ -f /etc/tproxy-server/config.json ]]; then
+		# A reinstall keeps whatever this host already serves. Rotating the
+		# prefix would invalidate every client link and drop live sessions, and
+		# a config predating the key is serving the root.
+		base_path="$(sed -n 's/.*"base_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/tproxy-server/config.json | head -n1)"
+	elif ! command -v base32 >/dev/null; then
+		echo "base32 (coreutils) is required to generate a base path; pass --base-path explicitly" >&2
+		exit 1
+	else
+		base_path="$(head -c 10 /dev/urandom | base32 | tr 'A-Z' 'a-z')"
+	fi
+fi
+if [[ -n "$base_path" ]] && ! [[ "$base_path" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*(/[A-Za-z0-9][A-Za-z0-9_-]*)*$ ]]; then
+	echo "base path segments must match [A-Za-z0-9][A-Za-z0-9_-]* joined by /" >&2
+	usage
+	exit 1
+fi
+if [[ ${#base_path} -gt 128 ]]; then
+	echo "base path must be at most 128 characters" >&2
+	exit 1
 fi
 if [[ ! "$hostname" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]] || [[ "$hostname" != *.* ]]; then
 	echo "hostname must be a lowercase ASCII DNS hostname" >&2
@@ -61,6 +92,10 @@ if [[ ! "$mtproxy_max_connections" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 repository="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "$static_routes" != exact && "$static_routes" != legacy ]]; then
+	echo "--static-routes must be exact or legacy" >&2
+	exit 2
+fi
 if [[ -n "$site_dir" ]] && [[ -n "$site_upstream" ]]; then
 	echo "--site-dir and --site-upstream are mutually exclusive" >&2
 	exit 2
@@ -167,12 +202,15 @@ else
 fi
 
 install -d -o root -g tproxy -m 0750 /etc/tproxy-server
+bash "$repository/deploy/ensure-token-key.sh"
 cat > /etc/tproxy-server/config.json <<EOF
 {
   "public_hostname": "$hostname",
+  "base_path": "$base_path",
   "listen": "127.0.0.1:8080",
   "admin_listen": "127.0.0.1:8081",
 $public_source
+  "static_routes": "$static_routes",
   "profiles_file": "/run/credentials/tproxy-server.service/profiles.json"
 }
 EOF
@@ -187,10 +225,50 @@ backend_secret="$secret"
 if [[ "$backend_secret" == dd* ]] && [[ ${#backend_secret} -eq 34 ]]; then
 	backend_secret="${backend_secret:2}"
 fi
+# MTProxy derives the AES keys for its RPC session with a Telegram middle-end
+# from its own source address (net/net-tcp-rpc-client.c passes
+# nat_translate_ip(c->our_ip) and c->our_port into aes_create_keys). When the
+# host is behind 1:1 NAT - EC2, GCE, a container bridge - the middle-end derives
+# its half from the post-NAT public address instead, the two disagree, and every
+# middle-end connection is dropped right after the handshake with "Disconnected
+# from RPC Middle-End". Clients still complete the obfuscated2 handshake and are
+# then answered by nobody, so the proxy looks reachable and every stream stalls.
+mtproxy_nat_args=
+# The address MTProxy binds its outbound middle-end sockets to.
+local_address="$(ip -4 route get 149.154.175.50 2>/dev/null |
+	sed -n 's/.*[[:space:]]src[[:space:]]\+\([0-9.]\+\).*/\1/p' | head -n 1)"
+# The address a middle-end sees those sockets arrive from. An echo service
+# measures the egress address directly, which is what MTProxy has to hash; the
+# hostname's own A record is the offline fallback.
+public_address=
+for probe in https://api.ipify.org https://ifconfig.co/ip https://icanhazip.com; do
+	candidate="$(curl --fail --silent --show-error --location --ipv4 --max-time 15 \
+		--proto '=https' --proto-redir '=https' --tlsv1.2 "$probe" 2>/dev/null |
+		tr -d '[:space:]')" || continue
+	if [[ "$candidate" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+		public_address="$candidate"
+		break
+	fi
+done
+if [[ -z "$public_address" ]]; then
+	public_address="$(getent ahostsv4 "$hostname" 2>/dev/null | awk 'NR==1 {print $1}')"
+fi
+if [[ -n "$local_address" ]] && [[ -n "$public_address" ]] &&
+	[[ "$local_address" != "$public_address" ]]; then
+	mtproxy_nat_args="--nat-info $local_address:$public_address"
+	echo "MTProxy is behind NAT ($local_address -> $public_address), using $mtproxy_nat_args"
+elif [[ "$local_address" =~ ^(10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.) ]] &&
+	[[ -z "$mtproxy_nat_args" ]]; then
+	echo "warning: $local_address is private and the public address could not be" >&2
+	echo "determined; set MTPROXY_NAT_ARGS=--nat-info $local_address:<public-ip> in" >&2
+	echo "/etc/mtproxy/mtproxy.env or MTProxy will accept clients and answer none" >&2
+fi
+
 cat > /etc/mtproxy/mtproxy.env <<EOF
 MTPROXY_SECRET=$backend_secret
 MTPROXY_WORKERS=$mtproxy_workers
 MTPROXY_MAX_CONNECTIONS=$mtproxy_max_connections
+MTPROXY_NAT_ARGS=$mtproxy_nat_args
 EOF
 chown root:mtproxy /etc/mtproxy/mtproxy.env
 chmod 0640 /etc/mtproxy/mtproxy.env
@@ -262,8 +340,37 @@ if [[ -e /etc/systemd/system/mtproxy.service.d/secrets.conf ]] && command -v /us
 	fi
 fi
 
+# The client-facing proxy secret. Under a base path it is base64url of the marker
+# byte 0x70 followed by the raw secret, so a client without base path support
+# reports an unsupported proxy type and asks the user to update, instead of
+# accepting a pathless proxy on an empty host. A root deployment keeps the plain
+# secret and keeps working in those clients. Never capture the raw secret in a
+# variable: it can contain NUL bytes, which command substitution drops.
+web_proxy_secret() {
+	if [[ -z "$base_path" ]]; then
+		printf %s "$secret"
+		return
+	fi
+	{
+		printf '\x70'
+		printf "$(printf %s "$secret" | sed 's/../\\x&/g')"
+	} | base64 | tr '+/' '-_' | tr -d '=\n'
+}
+
+client_address="$hostname"
+if [[ -n "$base_path" ]]; then
+	client_address="$hostname/$base_path"
+fi
+proxy_secret="$(web_proxy_secret)"
+
+# The hex secret is the value shared with MTProxy; a link under a base path must
+# not carry it. Label the two apart so neither is pasted in the other's place.
 echo
-echo "Installed for https://$hostname/"
+echo "Installed for https://$hostname/$base_path"
+echo "Internal mtproxy secret: $secret"
+echo "Proxy server:            $client_address"
+echo "Proxy secret:            $proxy_secret"
+echo "Proxy link:              https://t.me/webproxy?server=${client_address//\//%2F}&secret=$proxy_secret"
 echo "Check: systemctl --no-pager --full status caddy mtproxy tproxy-server"
 echo "Check: curl --fail https://$hostname/"
 echo "Check: curl --fail http://127.0.0.1:8081/readyz"

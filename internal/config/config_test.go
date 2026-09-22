@@ -22,7 +22,7 @@ func TestCapabilityVectors(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got := CapabilityString(DeriveCapability("proxy.example.com", secret))
+		got := CapabilityString(DeriveCapability("proxy.example.com", "", secret))
 		if got != test.want {
 			t.Fatalf("got %q, want %q", got, test.want)
 		}
@@ -133,7 +133,7 @@ func TestLoadAppliesDefaultsAndRelativePaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.PublicDir != public || len(loaded.Profiles) != 1 || loaded.Limits.MaxBodyBytes != 2*1024*1024 || loaded.Profiles[0].CarrierMode != CarrierHTTPSLanes {
+	if loaded.TokenKeyFile != filepath.Join(directory, "token.key") || loaded.StaticRoutes != "legacy" || loaded.PublicDir != public || len(loaded.Profiles) != 1 || loaded.Limits.MaxBodyBytes != 2*1024*1024 || loaded.Profiles[0].CarrierMode != CarrierHTTPSLanes {
 		t.Fatalf("unexpected loaded configuration: %#v", loaded)
 	}
 	profileLimits := loaded.Profiles[0].Limits

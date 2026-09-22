@@ -70,14 +70,14 @@ func TestPublicFallbackAndCarrierRoundTrip(t *testing.T) {
 	}
 
 	secret, _ := hex.DecodeString("000102030405060708090a0b0c0d0e0f")
-	capability := config.CapabilityString(config.DeriveCapability(testHost, secret))
+	capability := config.CapabilityString(config.DeriveCapability(testHost, "", secret))
 	for _, query := range []string{
 		"bridge=" + capability + "&extra=1",
 		"bridge=" + capability + "&bridge=" + capability,
 		"bridge=%" + hex.EncodeToString([]byte{capability[0]}) + capability[1:],
 	} {
 		fallback := perform(t, hosted.Client(), request(t, http.MethodGet, hosted.URL+"/?"+query, nil, ""))
-		if fallback.StatusCode != http.StatusOK || !bytes.Equal(readResponse(t, fallback), index) {
+		if fallback.StatusCode != http.StatusNotFound || bytes.Equal(readResponse(t, fallback), index) {
 			t.Fatal("augmented or duplicated valid bridge query did not return the public index")
 		}
 	}
@@ -721,12 +721,12 @@ func TestDynamicPublicUpstreamAndTransportCoexist(t *testing.T) {
 		t.Fatalf("invalid carrier did not receive the application fallback: %d", response.StatusCode)
 	}
 	secret, _ := hex.DecodeString("000102030405060708090a0b0c0d0e0f")
-	capability := config.CapabilityString(config.DeriveCapability(testHost, secret))
+	capability := config.CapabilityString(config.DeriveCapability(testHost, "", secret))
 	response = perform(t, hosted.Client(), request(t, http.MethodGet, hosted.URL+"/?bridge="+capability, nil, ""))
 	body := readResponse(t, response)
 	if response.StatusCode != http.StatusOK ||
 		response.Header.Get("X-Public-Application") != "" ||
-		!bytes.Contains(body, []byte("/api/v1/session")) {
+		!bytes.Contains(body, []byte("api/v1/session")) {
 		t.Fatalf("valid bridge was delegated to the public application: %d", response.StatusCode)
 	}
 	if len(requests) != 4 {
@@ -737,8 +737,8 @@ func TestDynamicPublicUpstreamAndTransportCoexist(t *testing.T) {
 			t.Fatalf("public application did not receive the original Host: %q", got)
 		}
 		if i == len(requests)-1 &&
-			(strings.Contains(got, "Bearer") || strings.Contains(got, "opaque carrier data")) {
-			t.Fatalf("carrier credentials or body reached the public application: %q", got)
+			(!strings.Contains(got, "Bearer") || !strings.Contains(got, "opaque carrier data")) {
+			t.Fatalf("random credentials or public body were stripped: %q", got)
 		}
 	}
 }
@@ -809,6 +809,10 @@ func newConfiguredTestServer(
 		t.Fatal(err)
 	}
 	value := config.Defaults()
+	value.TokenKeyFile = filepath.Join(t.TempDir(), "token.key")
+	if err := os.WriteFile(value.TokenKeyFile, bytes.Repeat([]byte{1}, 32), 0600); err != nil {
+		t.Fatal(err)
+	}
 	value.PublicHostname = testHost
 	value.PublicDir = directory
 	value.Timeouts.LongPoll = config.Duration(500 * time.Millisecond)
@@ -817,7 +821,7 @@ func newConfiguredTestServer(
 	value.Profiles = []config.Profile{{
 		Name:       "default",
 		Backend:    backend,
-		Capability: config.DeriveCapability(testHost, secret),
+		Capability: config.DeriveCapability(testHost, "", secret),
 	}}
 	if configure != nil {
 		configure(&value)
