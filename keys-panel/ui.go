@@ -35,18 +35,24 @@ const pageTemplates = `
 {{if .Flash}}<p class="flash {{if .FlashOK}}good{{else}}bad{{end}}">{{.Flash}}</p>{{end}}
 {{if .Error}}<p class="flash bad">{{.Error}}</p>{{end}}
 
-<p class="warn">Любое изменение ключей перезапускает релей и MTProxy: активные сессии
-оборвутся, клиенты переподключатся сами через несколько секунд.</p>
+<p class="warn">Добавление, отзыв и перевыпуск ключа перезапускают релей и MTProxy: активные
+сессии оборвутся, клиенты переподключатся сами через несколько секунд. Изменение
+метки или группы ничего не перезапускает.</p>
 
-<h2>Ключи</h2>
+<h2>Ключи <span class="dim small">({{len .Keys}})</span></h2>
+<input type="search" id="filter" class="filter" placeholder="Фильтр по имени, метке или группе…" autocomplete="off">
+<datalist id="groups-list">
+  {{range .Groups}}<option value="{{.}}">{{end}}
+</datalist>
 <div class="table-wrap">
-<table>
-  <thead><tr><th>Имя</th><th>Метка</th><th>Режим</th><th>Секрет</th><th>Создан</th><th></th></tr></thead>
+<table id="keys-table">
+  <thead><tr><th>Имя</th><th>Метка</th><th>Группа</th><th>Режим</th><th>Секрет</th><th>Создан</th><th></th></tr></thead>
   <tbody>
   {{range .Keys}}
-    <tr>
+    <tr class="key-row" data-search="{{.Profile.Name}} {{.Meta.Label}} {{.Meta.Group}}">
       <td class="mono nowrap">{{.Profile.Name}}</td>
       <td>{{if .Meta.Label}}{{.Meta.Label}}{{else}}—{{end}}</td>
+      <td>{{if .Meta.Group}}<span class="tag">{{.Meta.Group}}</span>{{else}}—{{end}}</td>
       <td class="mono dim">{{if .Profile.CarrierMode}}{{.Profile.CarrierMode}}{{else}}https{{end}}</td>
       <td class="mono nowrap">
         <span class="secret" data-full="{{.Profile.Secret}}" data-shown="0">••••••••••••••••</span>
@@ -56,6 +62,7 @@ const pageTemplates = `
       </td>
       <td class="dim nowrap">{{if .CreatedShort}}{{.CreatedShort}}{{else}}—{{end}}</td>
       <td class="actions">
+        <button class="mini edit-toggle" type="button">изменить</button>
         <form method="post" action="/keys/rotate" class="applying" data-confirm="Перевыпустить ключ {{.Profile.Name}}? Старая ссылка перестанет работать.">
           <input type="hidden" name="csrf" value="{{$.CSRF}}">
           <input type="hidden" name="name" value="{{.Profile.Name}}">
@@ -68,16 +75,30 @@ const pageTemplates = `
         </form>
       </td>
     </tr>
+    <tr class="edit-row hidden key-row" data-search="{{.Profile.Name}} {{.Meta.Label}} {{.Meta.Group}}">
+      <td colspan="7">
+        <form method="post" action="/keys/edit" class="edit-form">
+          <input type="hidden" name="csrf" value="{{$.CSRF}}">
+          <input type="hidden" name="name" value="{{.Profile.Name}}">
+          <label>Метка <input name="label" value="{{.Meta.Label}}" placeholder="например «Глеб — телефон»"></label>
+          <label>Группа <input name="group" list="groups-list" value="{{.Meta.Group}}" placeholder="например «Глеб»"></label>
+          <button type="submit">Сохранить</button>
+          <button type="button" class="mini edit-cancel">Отмена</button>
+        </form>
+      </td>
+    </tr>
   {{end}}
   </tbody>
 </table>
 </div>
+<p id="filter-empty" class="muted small hidden">Ничего не найдено.</p>
 
 <h2>Новый ключ</h2>
 <form class="add applying" method="post" action="/keys/add" data-confirm="Создать ключ? Релей перезапустится.">
   <input type="hidden" name="csrf" value="{{.CSRF}}">
   <input name="name" placeholder="имя (латиница, цифры, . _ -)" required>
-  <input name="label" placeholder="метка, например «телефон мамы»">
+  <input name="label" placeholder="метка, например «Глеб — телефон»">
+  <input name="group" list="groups-list" placeholder="группа, например «Глеб»">
   <select name="mode">
     <option value="">https (по умолчанию)</option>
     <option value="https-lanes">https-lanes</option>
@@ -141,6 +162,15 @@ button[disabled]{opacity:.5;cursor:progress}
 .mini.danger{color:#f0a9a3;border-color:#5d3733}
 .link-button{background:none;border:none;color:var(--muted);padding:4px 0}
 .link-button:hover{color:var(--text)}
+.hidden{display:none !important}
+.tag{display:inline-block;font-family:var(--mono);font-size:12px;
+  background:#1c2836;border:1px solid #2a3b4d;color:#8fc6d9;
+  border-radius:999px;padding:2px 10px}
+.filter{display:block;width:100%;max-width:420px;margin:0 0 14px}
+.edit-row td{background:#12171f}
+.edit-form{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end;padding:10px 4px}
+.edit-form label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted)}
+.edit-form input{min-width:220px}
 /* the masked placeholder stays compact so the action buttons are always in
    view; revealing widens the row and the wrapper scrolls it */
 .secret{display:inline-block;min-width:140px;letter-spacing:.08em}
@@ -168,8 +198,58 @@ input::placeholder{color:#5f6b7c}
 `
 
 const panelJS = `
+// Filtering is client-side over rows already in the page - fine at the scale
+// this table runs at, and needs no round trip to the server.
+var filterInput = document.getElementById('filter');
+if (filterInput) {
+  filterInput.addEventListener('input', function () {
+    var needle = filterInput.value.trim().toLowerCase();
+    var anyVisible = false;
+    document.querySelectorAll('#keys-table tbody tr.key-row').forEach(function (row) {
+      var isEditRow = row.classList.contains('edit-row');
+      var haystack = (row.dataset.search || '').toLowerCase();
+      var matches = needle === '' || haystack.indexOf(needle) !== -1;
+      if (isEditRow) {
+        // An edit row only ever shows via its own toggle, never via the
+        // filter directly - but it must stay hidden when its key is filtered
+        // out, so a stale open editor doesn't linger for a hidden row.
+        row.classList.toggle('hidden', !matches || row.dataset.editOpen !== '1');
+      } else {
+        row.classList.toggle('hidden', !matches);
+        if (matches) { anyVisible = true; }
+      }
+    });
+    var empty = document.getElementById('filter-empty');
+    if (empty) { empty.classList.toggle('hidden', anyVisible || needle === ''); }
+  });
+}
+
 document.addEventListener('click', function (event) {
   var target = event.target;
+
+  if (target.classList.contains('edit-toggle')) {
+    var row = target.closest('tr');
+    var editRow = row.nextElementSibling;
+    if (editRow && editRow.classList.contains('edit-row')) {
+      var opening = editRow.classList.contains('hidden');
+      editRow.classList.toggle('hidden', !opening);
+      editRow.dataset.editOpen = opening ? '1' : '0';
+      if (opening) {
+        var firstInput = editRow.querySelector('input[name=label]');
+        if (firstInput) { firstInput.focus(); }
+      }
+    }
+    return;
+  }
+
+  if (target.classList.contains('edit-cancel')) {
+    var editRow2 = target.closest('tr.edit-row');
+    if (editRow2) {
+      editRow2.classList.add('hidden');
+      editRow2.dataset.editOpen = '0';
+    }
+    return;
+  }
 
   if (target.classList.contains('reveal')) {
     var cell = target.parentElement.querySelector('.secret');
