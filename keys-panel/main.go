@@ -45,6 +45,8 @@ func main() {
 		cmdLink(paths, arguments)
 	case "status":
 		cmdStatus(paths)
+	case "backends":
+		cmdBackends(paths)
 	case "sync":
 		if err := Sync(paths); err != nil {
 			fail(err.Error())
@@ -73,6 +75,7 @@ func usage() {
   rotate -name N                         issue a new secret for an existing key
   link   -name N                         print the client link for one key
   status                                 service and readiness overview
+  backends                               list registered MTProxy backends and how full each is
   sync                                   rebuild MTProxy secrets from the profiles file
   serve  [-listen 127.0.0.1:9000]        run the local web panel
   token                                  print the web panel access token
@@ -314,6 +317,35 @@ func cmdStatus(paths Paths) {
 			active = "active"
 		}
 		fmt.Printf("%-14s %s\n", strings.TrimSuffix(unit, ".service")+":", active)
+	}
+}
+
+func cmdBackends(paths Paths) {
+	registry, err := LoadBackends(paths)
+	if err != nil {
+		fail(err.Error())
+	}
+	file, err := LoadProfiles(paths)
+	if err != nil {
+		fail(err.Error())
+	}
+	usage := backendUsage(file)
+	writer := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(writer, "ADDRESS\tUNIT\tUSED\tROOM")
+	for _, backend := range registry.Backends {
+		used := usage[backend.Address]
+		fmt.Fprintf(writer, "%s\t%s\t%d/%d\t%d\n", backend.Address, backend.Unit, used, maxSecretsPerBackend, maxSecretsPerBackend-used)
+	}
+	writer.Flush()
+	full := true
+	for _, backend := range registry.Backends {
+		if usage[backend.Address] < maxSecretsPerBackend {
+			full = false
+			break
+		}
+	}
+	if full {
+		fmt.Println("\nEvery registered backend is full; run deploy/provision-mtproxy-backend.sh before adding another key.")
 	}
 }
 

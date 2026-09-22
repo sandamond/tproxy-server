@@ -104,6 +104,7 @@ tproxy-keys revoke -name N                                delete a key and apply
 tproxy-keys rotate -name N                                issue a new secret for an existing key
 tproxy-keys link   -name N                                print the client link for one key
 tproxy-keys status                                        service and readiness overview
+tproxy-keys backends                                      list registered MTProxy backends and how full each is
 tproxy-keys sync                                          rebuild MTProxy secrets from profiles.json
 tproxy-keys serve  [-listen 127.0.0.1:9000]               run the local web panel
 tproxy-keys token                                         print the web panel access token
@@ -205,22 +206,63 @@ sudo cp /root/tproxy-keys-backup/meta.json /etc/tproxy-keys/meta.json
 sudo tproxy-keys sync
 ```
 
+## Multiple MTProxy backends
+
+Official MTProxy hard-caps the number of client secrets one process accepts
+at **16** — `net/net-tcp-rpc-ext-server.c` asserts `ext_secret_cnt < 16` and
+aborts. This is compiled in, not a runtime flag; there is no config option to
+raise it. It was found live, not in review: importing 60 keys into one
+backend crash-looped MTProxy, and `Apply()`'s own rollback (already in place
+for unrelated reasons) is what caught it and restored the previous key set -
+nothing had checked for this ceiling before that.
+
+`tproxy-keys` now tracks a **backend registry**
+(`/etc/tproxy-keys/backends.json`) of every official-MTProxy process it may
+assign secrets to, and picks the first one with room for each new key -
+filling one to 16 before ever touching the next. A deployment with no
+registry file behaves exactly as before: the one backend the reference
+installer has always set up (`127.0.0.1:2398`, `mtproxy.service`), so nothing
+about this is a required migration step for an existing single-backend
+install.
+
+Add capacity with:
+
+```bash
+sudo ./deploy/provision-mtproxy-backend.sh
+```
+
+This installs `deploy/mtproxy@.service` (a systemd template) as instance
+`mtproxy@1.service` on `127.0.0.1:2399`, `mtproxy@2.service` on `2400`, and so
+on - each with its own admin port, `firewall.nft` entry, and secrets file -
+and appends it to the registry. `tproxy-keys` starts filling a new backend
+automatically once the existing one(s) are full; nothing else changes about
+`add`/`import`/`revoke`/`rotate`. The original `mtproxy.service` (backend 0)
+is never touched by this script or template - it predates both.
+
+Only the backend(s) whose secret list actually changed get restarted -
+adding a key to backend 2 does not disconnect backend 0's users. `revoke`ing
+several keys back to back can still restart the same backend several times
+in quick succession, though, and systemd's default start-rate limit
+(5 restarts per 10s) can trip on that; if a unit ends up `start-limit-hit`,
+`systemctl reset-failed <unit>` clears it; nothing about the configuration
+itself is broken. `sync` also exists for exactly this kind of manual repair.
+
 ## Known limitations
 
 - **No per-key statistics.** The relay's `/metrics` is process-wide, with no
   breakdown by profile, and MTProxy's own stats port is not enabled by the
   reference deployment. `tproxy-keys` can tell you which keys exist, not which
   ones are actually in use or how much traffic each one has carried.
-- **No hot reload.** Every add, revoke, or rotate restarts both `mtproxy` and
-  `tproxy-server`, briefly dropping every active carrier session on the host,
-  not just the one belonging to the changed key.
-- **One MTProxy backend.** All profiles in this setup point at the same
-  `127.0.0.1:2398` official MTProxy. Giving a profile its own backend process
-  for separate quotas or routing (as the main README's "Multiple secrets on
-  one hostname" section describes) needs manual `profiles.json` and
-  `firewall.nft` edits; `tproxy-keys` doesn't manage multiple backends.
-- **Profile count is capped by the relay's own `limits.max_profiles`**
-  (`/etc/tproxy-server/config.json`, defaults to 32 if the field is absent).
+- **No hot reload.** Add, revoke, and rotate restart `tproxy-server`
+  unconditionally (profiles.json always changed) plus whichever MTProxy
+  backend(s) actually changed, briefly dropping every carrier session on the
+  affected backend(s) - not the whole deployment once more than one backend
+  exists, but still not per-key.
+- **One MTProxy process per 16 keys.** See "Multiple MTProxy backends" above -
+  this is official MTProxy's own ceiling, not a design choice here.
+- **Profile count is also capped by the relay's own `limits.max_profiles`**
+  (`/etc/tproxy-server/config.json`, defaults to 32 if the field is absent) -
+  independent of and on top of the 16-per-backend limit above.
   `tproxy-keys` reads that value itself before every `add`/`import` rather
   than hardcoding a number, so it can never silently drift from what the
   relay actually enforces at `-check` — but raising the ceiling itself (for a
