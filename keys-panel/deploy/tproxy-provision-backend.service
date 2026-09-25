@@ -1,0 +1,11 @@
+[Unit]
+Description=Provision one more official MTProxy backend (started by tproxy-keys when every backend holds 16 secrets)
+
+[Service]
+Type=oneshot
+# tproxy-keys itself runs sandboxed (no AF_NETLINK for nft, /etc/systemd
+# read-only), so it only asks systemd to start this unit. It takes no input:
+# the script and the template unit beside it are root-owned copies installed by
+# update-keys-panel.sh, never a path an unprivileged account can write to.
+ExecStart=/usr/local/lib/tproxy-keys/provision-mtproxy-backend.sh
+NoNewPrivileges=true

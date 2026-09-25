@@ -84,6 +84,15 @@ echo "Building tproxy-keys candidate with $go_binary"
 (cd "$module_root" && "$go_binary" build \
 	-trimpath -ldflags='-s -w' -o "$candidate" .)
 
+echo "Installing backend provisioning helper"
+repository_deploy="$(cd "$module_root/.." && pwd)/deploy"
+helper_directory=/usr/local/lib/tproxy-keys
+install -d -o root -g root -m 0755 "$helper_directory"
+install -o root -g root -m 0755 "$repository_deploy/provision-mtproxy-backend.sh" "$helper_directory/provision-mtproxy-backend.sh"
+install -o root -g root -m 0644 "$repository_deploy/mtproxy@.service" "$helper_directory/mtproxy@.service"
+install -o root -g root -m 0644 "$module_root/deploy/tproxy-provision-backend.service" /etc/systemd/system/tproxy-provision-backend.service
+systemctl daemon-reload
+
 echo "Installing tproxy-keys candidate"
 backup_next="$temporary/tproxy-keys.previous"
 cp -a "$installed" "$backup_next"

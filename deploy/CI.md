@@ -63,8 +63,15 @@ checkout at a fixed path; it calls
 the same test-build-validate-install-with-rollback scripts described in the
 main [`README.md`](../README.md#operations-and-updates) and
 [`keys-panel/README.md`](../keys-panel/README.md). It does not touch
-`profiles.json`, systemd units, Caddy, MTProxy's config, or the public site,
-matching those scripts' own documented scope.
+`profiles.json`, existing systemd units, Caddy, MTProxy's config, or the
+public site, matching those scripts' own documented scope. The one addition:
+`update-keys-panel.sh` also (re)installs the backend-provisioning helper -
+`provision-mtproxy-backend.sh` and `mtproxy@.service` as root-owned copies in
+`/usr/local/lib/tproxy-keys/`, plus the `tproxy-provision-backend.service`
+one-shot unit that runs it. The helper is never executed from the runner's
+workspace (which the unprivileged `ghrunner` account can write); `tproxy-keys`
+starts it only through systemd, with no arguments, when a new key finds every
+MTProxy backend at its 16-secret ceiling.
 
 **`ci-deploy.sh` and its sudoers grant are not redeployed by the pipeline
 they gate.** Installing `/usr/local/sbin/ci-deploy.sh` and the sudoers file

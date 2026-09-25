@@ -77,6 +77,18 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now tproxy-keys.service
 ```
 
+Install the backend provisioning helper (see
+[Multiple MTProxy backends](#multiple-mtproxy-backends); `update-keys-panel.sh`
+does this on every update, so it is only needed for a hand-made install):
+
+```bash
+sudo install -d -m 0755 /usr/local/lib/tproxy-keys
+sudo install -m 0755 ../deploy/provision-mtproxy-backend.sh /usr/local/lib/tproxy-keys/
+sudo install -m 0644 ../deploy/mtproxy@.service /usr/local/lib/tproxy-keys/
+sudo install -m 0644 deploy/tproxy-provision-backend.service /etc/systemd/system/
+sudo systemctl daemon-reload
+```
+
 Bring MTProxy's secret list in line with the drop-in immediately, rather than
 waiting for the first key change to discover it was out of sync:
 
@@ -225,17 +237,31 @@ installer has always set up (`127.0.0.1:2398`, `mtproxy.service`), so nothing
 about this is a required migration step for an existing single-backend
 install.
 
-Add capacity with:
+**Capacity is added automatically.** When `add`, `import` or the panel's Add
+form finds every registered backend at 16, `tproxy-keys` starts
+`tproxy-provision-backend.service`, waits for it, re-reads the registry and
+carries on - the key that needed the room simply lands on the new backend. The
+panel does not add the backend itself: it runs sandboxed (no netlink for
+`nft`, `/etc/systemd` read-only), so it only asks systemd to run a root-owned
+helper that takes no arguments. The helper has its own sanity bound (instance
+9, i.e. 160 keys); past it the add fails with an error rather than looping.
+The whole batch is validated first, so a typo'd name never provisions a
+backend for nothing. If the helper unit is not installed (a hand-made install
+that skipped it), the add fails and says to run the script by hand.
+
+To add capacity ahead of time, run the same script yourself:
 
 ```bash
 sudo ./deploy/provision-mtproxy-backend.sh
 ```
 
-This installs `deploy/mtproxy@.service` (a systemd template) as instance
+Either way this installs `deploy/mtproxy@.service` (a systemd template) as instance
 `mtproxy@1.service` on `127.0.0.1:2399`, `mtproxy@2.service` on `2400`, and so
 on - each with its own admin port, `firewall.nft` entry, and secrets file -
-and appends it to the registry. `tproxy-keys` starts filling a new backend
-automatically once the existing one(s) are full; nothing else changes about
+and appends it to the registry. The firewall table is *reloaded*, not
+restarted - `tproxy-server.service` `Requires=` the firewall unit, so a restart
+would restart the relay and drop live sessions. `tproxy-keys` fills a new
+backend once the existing one(s) are full; nothing else changes about
 `add`/`import`/`revoke`/`rotate`. The original `mtproxy.service` (backend 0)
 is never touched by this script or template - it predates both.
 
@@ -262,7 +288,8 @@ itself is broken. `sync` also exists for exactly this kind of manual repair.
   this is official MTProxy's own ceiling, not a design choice here.
 - **Profile count is also capped by the relay's own `limits.max_profiles`**
   (`/etc/tproxy-server/config.json`, defaults to 32 if the field is absent) -
-  independent of and on top of the 16-per-backend limit above.
+  independent of and on top of the 16-per-backend limit above, and checked
+  before any backend is auto-provisioned.
   `tproxy-keys` reads that value itself before every `add`/`import` rather
   than hardcoding a number, so it can never silently drift from what the
   relay actually enforces at `-check` — but raising the ceiling itself (for a

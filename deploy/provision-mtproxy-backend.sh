@@ -5,15 +5,20 @@ set -euo pipefail
 # backend(s) are at official MTProxy's own hard ceiling of 16 client secrets
 # per process (net/net-tcp-rpc-ext-server.c: assert(ext_secret_cnt < 16) in
 # https://github.com/TelegramMessenger/MTProxy - not configurable, not ours
-# to raise). Run this once per extra 16 keys needed; tproxy-keys then fills
-# it automatically like any other registered backend.
+# to raise). tproxy-keys fills a new backend automatically like any other
+# registered one, and starts this script itself (through
+# tproxy-provision-backend.service) when a new key finds every backend full,
+# so running it by hand only adds capacity ahead of time.
 #
 # The very first backend (127.0.0.1:2398, mtproxy.service) is never managed
 # by this script or the mtproxy@.service template - it predates both and is
 # left exactly as the reference installer set it up.
 
 registry=/etc/tproxy-keys/backends.json
-repository="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# mtproxy@.service sits next to this script, both in the repository's deploy/
+# and in the root-owned /usr/local/lib/tproxy-keys/ copy that
+# tproxy-provision-backend.service runs.
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ "${EUID}" -ne 0 ]]; then
 	echo "run as root" >&2
@@ -84,7 +89,7 @@ EOF
 chown root:mtproxy "$env_file"
 chmod 0640 "$env_file"
 
-install -m 0644 "$repository/deploy/mtproxy@.service" /etc/systemd/system/mtproxy@.service
+install -m 0644 "$here/mtproxy@.service" /etc/systemd/system/mtproxy@.service
 
 # Regenerate the full port list from every known instance (the original
 # 2398/8888 plus every mtproxy@N.service, including the one just added)
@@ -111,7 +116,10 @@ EOF
 install -m 0644 "$firewall_temp" /etc/tproxy-server/firewall.nft
 rm -f "$firewall_temp"
 systemctl daemon-reload
-systemctl restart tproxy-firewall.service
+# reload, not restart: tproxy-server.service Requires= this unit, so a restart
+# here would restart the relay and drop every live session. The unit's
+# ExecReload re-applies the same file.
+systemctl reload-or-restart tproxy-firewall.service
 
 systemctl enable --now "mtproxy@${next}.service"
 for ((attempt = 0; attempt != 10; ++attempt)); do
