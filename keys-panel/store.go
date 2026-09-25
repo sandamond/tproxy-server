@@ -135,9 +135,55 @@ func pickBackend(registry *BackendRegistry, usage map[string]int) (string, error
 			return backend.Address, nil
 		}
 	}
-	return "", fmt.Errorf(
-		"every registered backend is at official MTProxy's %d-secret limit; run deploy/provision-mtproxy-backend.sh to add capacity",
-		maxSecretsPerBackend)
+	return "", errBackendsFull
+}
+
+var errBackendsFull = fmt.Errorf(
+	"every registered backend is at official MTProxy's %d-secret limit", maxSecretsPerBackend)
+
+// provisionUnit is the one-shot unit installed by keys-panel/deploy/
+// update-keys-panel.sh. The panel is sandboxed too tightly to add a backend
+// itself (no netlink for nft, /etc/systemd read-only), so it asks systemd to
+// run the root-owned helper instead.
+const provisionUnit = "tproxy-provision-backend.service"
+
+// provisionBackend is a variable so tests can stand in for systemd.
+var provisionBackend = func() error {
+	err := systemctl("start", provisionUnit)
+	if err == nil {
+		return nil
+	}
+	detail := err.Error()
+	if log, logErr := exec.Command("journalctl", "-u", provisionUnit, "-n", "3", "--no-pager", "-o", "cat").Output(); logErr == nil {
+		if text := strings.Join(strings.Fields(strings.ReplaceAll(string(log), "\n", " | ")), " "); text != "" {
+			detail += " (" + text + ")"
+		}
+	}
+	return errors.New(detail)
+}
+
+// chooseBackend picks a backend with room; when every registered one is full
+// it provisions one more and looks again. A failed or ineffective provisioning
+// is an error, never a retry loop: the helper has its own sanity bound on how
+// many backends it will create.
+func chooseBackend(p Paths, registry **BackendRegistry, usage map[string]int) (string, error) {
+	backend, err := pickBackend(*registry, usage)
+	if !errors.Is(err, errBackendsFull) {
+		return backend, err
+	}
+	if err := provisionBackend(); err != nil {
+		return "", fmt.Errorf("%w; adding a backend automatically failed (%v) - run deploy/provision-mtproxy-backend.sh by hand", errBackendsFull, err)
+	}
+	reloaded, err := LoadBackends(p)
+	if err != nil {
+		return "", err
+	}
+	*registry = reloaded
+	backend, err = pickBackend(*registry, usage)
+	if err != nil {
+		return "", fmt.Errorf("%w even after provisioning another backend", err)
+	}
+	return backend, nil
 }
 
 var nameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`)
@@ -667,8 +713,14 @@ func AddKeys(p Paths, requests []NewKeyRequest) ([]Profile, error) {
 	// looked free before the batch started.
 	usage := backendUsage(file)
 
+	// Validate the whole batch before assigning backends, so a typo in the
+	// last name - or a batch over the relay's max_profiles, which Apply would
+	// reject anyway - can't leave a freshly provisioned backend behind for
+	// nothing.
+	if limit := maxProfiles(p); len(file.Profiles)+len(requests) > limit {
+		return nil, fmt.Errorf("the relay's configured limits.max_profiles is %d; this would exceed it", limit)
+	}
 	seenInBatch := map[string]bool{}
-	added := make([]Profile, 0, len(requests))
 	for _, request := range requests {
 		name := strings.TrimSpace(request.Name)
 		if !nameRE.MatchString(name) {
@@ -680,11 +732,16 @@ func AddKeys(p Paths, requests []NewKeyRequest) ([]Profile, error) {
 		if !validCarrier(request.Mode) {
 			return nil, fmt.Errorf("key %q: carrier mode must be one of %s", name, carrierModes)
 		}
-		backend, err := pickBackend(registry, usage)
+		seenInBatch[name] = true
+	}
+
+	added := make([]Profile, 0, len(requests))
+	for _, request := range requests {
+		name := strings.TrimSpace(request.Name)
+		backend, err := chooseBackend(p, &registry, usage)
 		if err != nil {
 			return nil, fmt.Errorf("key %q: %w", name, err)
 		}
-		seenInBatch[name] = true
 		usage[backend]++
 		secret, err := NewSecret()
 		if err != nil {

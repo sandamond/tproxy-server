@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -158,6 +159,99 @@ func TestPickBackendRejectsWhenEveryBackendIsFull(t *testing.T) {
 	usage := map[string]int{"127.0.0.1:2398": maxSecretsPerBackend, "127.0.0.1:2399": maxSecretsPerBackend}
 	if _, err := pickBackend(registry, usage); err == nil {
 		t.Fatal("expected an error when every backend is at the 16-secret ceiling")
+	}
+}
+
+func stubProvision(t *testing.T, fn func() error) *int {
+	t.Helper()
+	calls := 0
+	original := provisionBackend
+	provisionBackend = func() error {
+		calls++
+		return fn()
+	}
+	t.Cleanup(func() { provisionBackend = original })
+	return &calls
+}
+
+func fullUsage() map[string]int {
+	return map[string]int{"127.0.0.1:2398": maxSecretsPerBackend, "127.0.0.1:2399": maxSecretsPerBackend}
+}
+
+func TestChooseBackendDoesNotProvisionWhileThereIsRoom(t *testing.T) {
+	p, _, _ := twoBackendPaths(t)
+	registry, _ := LoadBackends(p)
+	calls := stubProvision(t, func() error { return nil })
+	got, err := chooseBackend(p, &registry, map[string]int{"127.0.0.1:2398": maxSecretsPerBackend})
+	if err != nil || got != "127.0.0.1:2399" {
+		t.Fatalf("chooseBackend = %q, %v", got, err)
+	}
+	if *calls != 0 {
+		t.Fatalf("provisioned %d times although a backend had room", *calls)
+	}
+}
+
+func TestChooseBackendProvisionsWhenEveryBackendIsFull(t *testing.T) {
+	p, envA, envB := twoBackendPaths(t)
+	registry, _ := LoadBackends(p)
+	calls := stubProvision(t, func() error {
+		writeBackends(t, p, []BackendInfo{
+			{Address: "127.0.0.1:2398", Unit: "mtproxy.service", EnvFile: envA},
+			{Address: "127.0.0.1:2399", Unit: "mtproxy@1.service", EnvFile: envB},
+			{Address: "127.0.0.1:2400", Unit: "mtproxy@2.service", EnvFile: envB + "2"},
+		})
+		return nil
+	})
+	usage := fullUsage()
+	for i := 0; i < 3; i++ {
+		got, err := chooseBackend(p, &registry, usage)
+		if err != nil || got != "127.0.0.1:2400" {
+			t.Fatalf("pick %d: chooseBackend = %q, %v", i, got, err)
+		}
+		usage[got]++
+	}
+	if *calls != 1 {
+		t.Fatalf("provisioned %d times, want exactly once for a batch that fits one new backend", *calls)
+	}
+}
+
+func TestChooseBackendReportsFailedProvisioning(t *testing.T) {
+	p, _, _ := twoBackendPaths(t)
+	registry, _ := LoadBackends(p)
+	stubProvision(t, func() error { return fmt.Errorf("unit not found") })
+	_, err := chooseBackend(p, &registry, fullUsage())
+	if err == nil || !errors.Is(err, errBackendsFull) ||
+		!strings.Contains(err.Error(), "unit not found") ||
+		!strings.Contains(err.Error(), "provision-mtproxy-backend.sh") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestChooseBackendDoesNotLoopWhenProvisioningAddsNothing(t *testing.T) {
+	p, _, _ := twoBackendPaths(t)
+	registry, _ := LoadBackends(p)
+	calls := stubProvision(t, func() error { return nil })
+	if _, err := chooseBackend(p, &registry, fullUsage()); err == nil {
+		t.Fatal("expected an error when provisioning left every backend full")
+	}
+	if *calls != 1 {
+		t.Fatalf("provisioned %d times, want a single attempt", *calls)
+	}
+}
+
+func TestAddKeysRejectsOverMaxProfilesBeforeProvisioning(t *testing.T) {
+	p := isolatedPaths(t) // max_profiles 5, one existing key
+	p.Backends = filepath.Join(filepath.Dir(p.Profiles), "does-not-exist.json")
+	calls := stubProvision(t, func() error { return nil })
+	requests := make([]NewKeyRequest, 5)
+	for i := range requests {
+		requests[i] = NewKeyRequest{Name: fmt.Sprintf("extra%d", i)}
+	}
+	if _, err := AddKeys(p, requests); err == nil || !strings.Contains(err.Error(), "max_profiles") {
+		t.Fatalf("expected a max_profiles error, got %v", err)
+	}
+	if *calls != 0 {
+		t.Fatalf("provisioned %d times for a batch the relay would reject", *calls)
 	}
 }
 

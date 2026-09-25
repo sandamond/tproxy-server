@@ -23,6 +23,8 @@ on:
       - 'go.sum'
       - 'keys-panel/**'
       - 'deploy/update-relay.sh'
+      - 'deploy/provision-mtproxy-backend.sh'
+      - 'deploy/mtproxy@.service'
       - '.github/workflows/deploy.yml'
 
 permissions:

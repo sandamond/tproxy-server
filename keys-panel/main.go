@@ -345,7 +345,7 @@ func cmdBackends(paths Paths) {
 		}
 	}
 	if full {
-		fmt.Println("\nEvery registered backend is full; run deploy/provision-mtproxy-backend.sh before adding another key.")
+		fmt.Println("\nEvery registered backend is full; the next add/import provisions another one automatically (or run deploy/provision-mtproxy-backend.sh now to add capacity ahead of time).")
 	}
 }
 
